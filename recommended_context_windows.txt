@@ -1,0 +1,2 @@
+qwen3.6:27b - 96000 total, 80K input + 14K output
+qwen3.8:27b - 80000 total, 64K input + 14K output
