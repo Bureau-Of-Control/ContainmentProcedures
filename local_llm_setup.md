@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document provides a guide for setting up a secure setup with local Large Language Model (LLM) development environment using Qwen 3.6 27B with GPU acceleration. The setup utilizes Docker containers with WSL2 on Windows host to create an isolated sandboxed environment. Most security achieved when such deployment is used in combination with sandbox-to-sandbox setup, where main development laptop is runnning sandboxed development container for VS code too, and hardening measures, described in the end section of the document.
+This document provides a guide for setting up a secure setup with local Large Language Model (LLM) development environment using Qwen 3.8 27B with GPU acceleration. The setup utilizes Docker containers with WSL2 on Windows host to create an isolated sandboxed environment. Most security achieved when such deployment is used in combination with sandbox-to-sandbox setup, where main development laptop is runnning sandboxed development container for VS code too, and hardening measures, described in the end section of the document.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ graph TD
     D --> F[NVIDIA GPU]
     D --> G[Ollama LLM Engine]
     G --> F
-    G --> H[Qwen 3.6 27B]
+    G --> H[Qwen 3.8 27B]
     H --> G
     G --> I[Container Port 11434 bound to Host Port 8080]
     I --> A
@@ -37,7 +37,7 @@ graph TD
 - 35-40 GB SSD free space
 - Docker Desktop for Windows
 
-Setup like described allows to run Qwen 3.6 27B with 96K tokens context window, configured to use 80K tokens for input and 14K tokens for output. With OLLAMA_NUM_PARALLEL=1, only one request is processed at a time, so the KV cache only needs headroom for output generation (~3-5 GB), not an entire extra context window. Note that this setup can handle context window up to 128K, but it will run very close to max VRAM limits and will often hit the max VRAM on complex tasks. The reduced max context from 128K to 96K provides the required free VRAM safety margin while keeping full q8_0 precision for heavy coding tasks.
+Setup like described allows to run Qwen 3.8 27B with 80K tokens context window, configured to use 80K tokens for input and 14K tokens for output. With OLLAMA_NUM_PARALLEL=1, only one request is processed at a time, so the KV cache only needs headroom for output generation (~3-5 GB), not an entire extra context window. Note that this setup can handle context window up to 128K, but it will run very close to max VRAM limits with Q8 cache precision and will often hit the max VRAM on complex tasks. The reduced max context from 128K to 80K provides the required free VRAM safety margin while keeping full Q8 precision for heavy coding tasks. Adequate amount of VRAM you need to keep free after loading model and pre-allocating its context window is around 1.5-2.0GB. To determine which size of context window you can use with your model, you can use script `utility/ctx_sweep.sh` from this repository.
 
 ## Setup Process
 
@@ -100,7 +100,7 @@ RUN usermod -l $USERNAME ubuntu \
 
 # Configure global environment variable for Ollama models (both build-time and run-time)
 ENV OLLAMA_MODELS=/workspaces/Code/models
-ENV OLLAMA_CONTEXT_LENGTH=96000
+ENV OLLAMA_CONTEXT_LENGTH=80000
 ENV OLLAMA_HOST=0.0.0.0
 ENV OLLAMA_KEEP_ALIVE=24h
 
@@ -139,7 +139,7 @@ This file instructs VS Code to build the container, inject your RTX 3090 via Doc
     "OLLAMA_KV_CACHE_TYPE": "q8_0",
     "OLLAMA_NUM_PARALLEL": "1",
     "OLLAMA_MODELS": "/workspaces/Code/models",
-    "OLLAMA_CONTEXT_LENGTH": "96000",
+    "OLLAMA_CONTEXT_LENGTH": "80000",
     "OLLAMA_KEEP_ALIVE": "24h",
     "NVIDIA_VISIBLE_DEVICES": "all",
     "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
@@ -175,7 +175,7 @@ Also note binding of container port 11434 to host system port 8080 and OLLAMA_KE
 5. VS Code will detect the configuration files and show a pop-up in the bottom right. Click Reopen in Container.
 6. The initial build will pull the base CUDA layers.
 
-### Phase 4: Download models (one-time)
+### Phase 4: Download models and create a Modelfile to tune up model parameters (one-time)
 
 To not pull 20+ GBs every single time, we store models in persistent folder in our workspace: `/workspaces/Code/models`
 But we need to pull these first. As soon as dev container will start up for the first time, open up two new Terminals via Ctrl+Shift+` and issue the commands:
@@ -188,20 +188,63 @@ ollama serve
 And leave it running, then in second terminal:
 ```bash
 ollama pull nomic-embed-text
-ollama pull qwen3.6:27b
+ollama pull qwen3.8:27b
 ```
 
 Which will pull the models. Then check the contents of `/workspaces/Code/models` - you should see blobs and manifests folders in there.
-Now Ctrl-C the ollama in the first terminal.
+
+Now we need to tune up model parameters a bit. Thing is that while Qwen is very capable coding model, on stock settings it's very prone to overthinking things and while doing so, it's often falling into endless reasoning loops with "Wait, let me reconsider..." reasoning about the same sequence of things over and over again, which is very annoying, garbages up the context and requires human interaction to fall out of the reasoning loops. To get rid of this behavior, we need to create a model wrapper in Ollama: custom Modelfile with our own parameters.
+
+Create a folder named `custom` in `/workspaces/Code`, and inside, create the file named `Modelfile` without extension with the following content:
+
+```dockerfile
+# Inherit from your installed Qwen 3 model
+FROM qwen3.8:27b
+
+# Adjust decoding parameters to break loops
+PARAMETER temperature 0.3
+PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.08
+PARAMETER num_predict 4096
+
+# Define explicit behavioral guardrails
+SYSTEM """
+You are an expert software engineer. Work out your solution step-by-step. 
+Do not repeat previous reasoning steps or restate assumptions unnecessarily. 
+If you reach an impasse or identify an error, state the issue once and pivot to an alternative implementation.
+"""
+```
+
+Here is a breakdown of what each `PARAMETER` does and how well they work together:
+
+`temperature 0.3` - Controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.3) is a very good setting for technical tasks, coding, or facts. It forces the model to choose highly probable, accurate words, which naturally prevents it from wandering into weird, repetitive loops.
+
+`top_p 0.95` - also known as "nucleus sampling", this filters out the least likely words. The model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.95) is the industry standard. It acts as a safety net. It keeps the model creative enough to sound natural, while your temperature (0.3) keeps it focused.
+
+`repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases. A value of 1.0 means no penalty, our value is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
+
+`num_predict 4096` - this sets the maximum number of tokens (roughly 3,000 words) the model is allowed to generate in a single response. Our setting (4096) is very generous. It ensures the model has plenty of room to finish long explanations or complex code blocks without getting abruptly cut off.
+
+And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to 1-2 times a day and it happens now only on complex reasoning tasks. 
+
+Now, having a Modelfile let's create a model wrapper:
+
+```bash
+ollama create qwen3-coder -f custom/Modelfile
+```
+
+This will create a wrapper and will register it as a list of models available in Ollama. This is a very fast operation. Write down the ID of the model you gave to wrapper (`qwen3-coder` in the example above).
+
+Now Ctrl-C the ollama in the first terminal, we're done with this step.
 
 ### Phase 5: Starting up
 
 After container startup and having models downloaded, start the ollama like this:
 ```bash
-OLLAMA_CONTEXT_LENGTH=96000 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve > /tmp/ollama.log 2>&1 & sleep 3 && ollama run qwen3.6:27b ""
+OLLAMA_CONTEXT_LENGTH=80000 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve > /tmp/ollama.log 2>&1 & sleep 3 && ollama run qwen3-coder ""
 ```
 
-This will start ollama and pre-warm qwen3.6, as soon as execution finishes you should be able to start working.
+This will start ollama and pre-warm the model immediately, as soon as execution finishes you should be able to start working.
 
 Your LLM engine (ollama) should now be running inside the container at http://localhost:11434 and be bound to host system port 8080.
 
@@ -253,19 +296,19 @@ This option works best overall. First I've tried this setup with Continue.dev ex
 	"apiType": "chat-completions",
 	"models": [
 		{
-			"id": "qwen3.6:27b",
-			"name": "Qwen 3.6 27B",
+			"id": "qwen3-coder",
+			"name": "Qwen 3.8 27B",
 			"url": "http://192.168.10.10:8080",
 			"toolCalling": true,
 			"vision": false,
-			"maxInputTokens": 80000,
+			"maxInputTokens": 64000,
 			"maxOutputTokens": 14000
 		}
 	]
 }
 ```
 
-Make sure to fill in the "id" parameter matching the one you have downloaded in ollama exactly. In this case it's `qwen3.6:27b` for me. Add endpoint URL (here "http://192.168.10.10:8080") and don't forget to set model context - here sum of "maxInputTokens" and "maxOutputTokens" should be slightly less than total window set in ollama (96000). "Slightly less" is literal here: note that the whole context window of 96K tokens is not fully allocated. There's a headroom of 2K tokens, and that's intentional. LLM prompt results might slightly vary in size and sometimes can grow a bit larger than allocated buffer limits which will truncate the output in best case, or will cause "request body too big" errors on Copilot side, wasting a perfectly fine formulated answer which you will have to re-calculate again from scratch. So leave as is, and in case you will have more headroom, add it to maxInputTokens instead of maxOutputTokens. 14K maxOutputTokens is around the biggest safe value which can be consumed by Copilot without intermittent issues when communicating with Ollama.
+Make sure to fill in the "id" parameter matching the one you have downloaded in ollama exactly. In this case it's `qwen3-coder` - custom model wrapper we have created. Add endpoint URL (here "http://192.168.10.10:8080") and don't forget to set model context - here sum of "maxInputTokens" and "maxOutputTokens" should be slightly less than total window set in ollama (80000). "Slightly less" is literal here: note that the whole context window of 80K tokens is not fully allocated. There's a headroom of 2K tokens, and that's intentional. LLM prompt results might slightly vary in size and sometimes can grow a bit larger than allocated buffer limits which will truncate the output in best case, or will cause "request body too big" errors on Copilot side, wasting a perfectly fine formulated answer which you will have to re-calculate again from scratch. So leave as is, and in case you will have more headroom, add it to maxInputTokens instead of maxOutputTokens. 14K maxOutputTokens is around the biggest safe value which can be consumed by Copilot without intermittent issues when communicating with Ollama.
 
 #### Option 2: Cursor extension
 
@@ -279,7 +322,7 @@ Note: This should be possible but I was unable to configure it yet - relevant op
    http://192.168.10.10:8080
    ```
 5. Enter a dummy API key if required (e.g., ollama).
-6. Click Add Model, enter the exact name of your pulled model (e.g., qwen3.6:27b), and toggle it on. Turn off any cloud models you don't intend to use.
+6. Click Add Model, enter the exact name of your pulled model (e.g., qwen3.8:27b), and toggle it on. Turn off any cloud models you don't intend to use.
 
 ## Security Analysis
 
@@ -306,7 +349,7 @@ The setup implements several security controls:
 - **Mitigation**:
   - Use a sandbox-to-sandbox communication setup
   - Monitor and log all interactions
-- **Risk assesment**: Low, models optimized for local work, like Qwen 3.6 used in this guide, doesn't typically hold any long-lived persistent data cache, and in this case any cache will remain inside the container
+- **Risk assesment**: Low, models optimized for local work, like Qwen 3.8 used in this guide, doesn't typically hold any long-lived persistent data cache, and in this case any cache will remain inside the container
 
 #### 3. Container Escape Risk (Low)
 - **Risk**: Potential privilege escalation within container
@@ -340,7 +383,7 @@ The setup implements several security controls:
    - Encrypt sensitive model data at rest:
      - Store working directory and models on BitLocker-encrypted drive
    - Implement data loss prevention policies:
-     - To prevent any potential data leaks, use sandbox-to-sandbox communication setup - to connect to this sandboxed LLM service from your laptop, also use a sandboxed containerized dev environment, which will have no acceess to anything on development laptop other than code. This way whole setup will be watertight and will only have access to code and nothing else.
+     - To prevent any potential data leaks, use sandbox-to-sandbox communication setup - to connect to this sandboxed LLM service from your laptop, also use a sandboxed containerized dev environment, which will have no acceess to anything on development laptop other than code. This way whole setup will be watertight and will only have access to code and nothing else. For details on setting up sandboxed development environment refer to documents `vs_code_sandbox.md` and `cursor_sandbox.md` in this repository.
      - Any data cached by model in this setup remains inside the container. Wipe the whole container periodically to minimize risks. After initial configuration was done, spin up of such environment takes minutes, so container can be easily wiped out and created from scratch every single day to not have any sensitive data remaining.
    - Regular security scanning of workspace files
 
