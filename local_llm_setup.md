@@ -12,12 +12,14 @@ graph TD
     B --> C[Docker Desktop]
     C --> D[WSL2 Ubuntu 24.04 Container Sandbox]
     D --> F[NVIDIA GPU]
-    D --> G[Ollama LLM Engine]
+    D --> P[ollama_proxy.py on port 8050]
+    D --> G[Ollama LLM Engine :11434]
     G --> F
     G --> H[Qwen 3.8 27B]
     H --> G
-    G --> I[Container Port 11434 bound to Host Port 8080]
-    I --> A
+    P --> G
+    B --> I[Container Port 8050 bound to Host Port 8080]
+    I --> P
 
     style A fill:#e1f5fe
     style B fill:#f3e5f5
@@ -27,6 +29,7 @@ graph TD
     style G fill:#fff8e1
     style H fill:#ffebee
     style I fill:#e0f2f1
+    style P fill:#fce4ec
 ```
 
 ## System Requirements for LLM host
@@ -85,6 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg2 \
     zstd \
     sudo \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Use the official install.sh direct endpoint
@@ -100,11 +104,13 @@ RUN usermod -l $USERNAME ubuntu \
 
 # Configure global environment variable for Ollama models (both build-time and run-time)
 ENV OLLAMA_MODELS=/workspaces/Code/models
-ENV OLLAMA_CONTEXT_LENGTH=80000
+ENV OLLAMA_CONTEXT_LENGTH=82000
+ENV OLLAMA_KV_CACHE_TYPE=q8_0
 ENV OLLAMA_HOST=0.0.0.0
 ENV OLLAMA_KEEP_ALIVE=24h
 
 EXPOSE 11434
+EXPOSE 8050
 
 # Fix permissions so both root (during build) and coder (at runtime) can access it
 RUN mkdir -p $OLLAMA_MODELS && chown -R $USERNAME:$USERNAME /workspaces/Code/models
@@ -131,7 +137,7 @@ This file instructs VS Code to build the container, inject your RTX 3090 via Doc
   "runArgs": [
     "--ipc=host",
     "--mount=type=bind,src=/usr/lib/wsl/drivers,dst=/usr/lib/wsl/drivers,readonly",
-    "-p", "0.0.0.0:8080:11434"
+    "-p", "0.0.0.0:8080:8050"
   ],
   "containerEnv": {
     "OLLAMA_HOST": "0.0.0.0",
@@ -139,8 +145,10 @@ This file instructs VS Code to build the container, inject your RTX 3090 via Doc
     "OLLAMA_KV_CACHE_TYPE": "q8_0",
     "OLLAMA_NUM_PARALLEL": "1",
     "OLLAMA_MODELS": "/workspaces/Code/models",
-    "OLLAMA_CONTEXT_LENGTH": "80000",
+    "OLLAMA_CONTEXT_LENGTH": "82000",
     "OLLAMA_KEEP_ALIVE": "24h",
+    "OLLAMA_MAX_LOADED_MODELS": "1",
+    "OLLAMA_NUM_GPU": "9999",
     "NVIDIA_VISIBLE_DEVICES": "all",
     "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
     "LD_LIBRARY_PATH": "/usr/lib/wsl/drivers"
@@ -163,8 +171,8 @@ This file instructs VS Code to build the container, inject your RTX 3090 via Doc
 
 Note:
 
-The "--ipc=host" flag prevents memory bottlenecks during high-throughput LLM token generation.
-Also note binding of container port 11434 to host system port 8080 and OLLAMA_KEEP_ALIVE set to 24h to not offload the model after some minutes of inactivity.
+The `--ipc=host` flag prevents memory bottlenecks during high-throughput LLM token generation.
+Also note binding of container port 8050 (our proxy, see Phase 5) to host system port 8080 and OLLAMA_KEEP_ALIVE set to 24h to not offload the model after some minutes of inactivity. Ollama itself stays on its internal port 11434 inside the container — only the proxy is exposed externally.
 
 ### Phase 3: Spin Up and Initialize the Sandbox
 
@@ -239,16 +247,62 @@ Now Ctrl-C the ollama in the first terminal, we're done with this step.
 
 ### Phase 5: Starting up
 
-After container startup and having models downloaded, start the ollama like this:
+After container startup and having models downloaded, create a small launcher script `start_llm.sh` (or get a ready-to-use one from this repository, `utility/start_llm.sh`) in `/workspaces/Code` (one-time) that starts both ollama and the proxy together:
+
 ```bash
-OLLAMA_CONTEXT_LENGTH=80000 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve > /tmp/ollama.log 2>&1 & sleep 3 && ollama run qwen3-coder ""
+#!/usr/bin/env bash
+# start_llm.sh — launch Ollama + ollama_proxy.py together.
+# Ctrl-C stops both. Logs: /tmp/ollama.log, /tmp/ollama_proxy.log
+set -euo pipefail
+cd "$(dirname "$0")"
+
+export OLLAMA_CONTEXT_LENGTH=82000
+export OLLAMA_KV_CACHE_TYPE=q8_0
+
+# 1) Start Ollama in the background
+nohup ollama serve > /tmp/ollama.log 2>&1 &
+OLLAMA_PID=$!
+PROXY_PID=""
+
+# Stop everything on Ctrl-C / script exit
+cleanup() { [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null; kill "$OLLAMA_PID" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+# 2) Wait until Ollama answers, then pre-warm the model
+for i in $(seq 1 30); do
+    if curl -sf http://127.0.0.1:11434/api/version > /dev/null; then break; fi
+    sleep 1
+done
+ollama run qwen3-coder ""
+
+# 3) Start the proxy in front of Ollama (internal port 8050, bound to host 8080)
+python3 -u ollama_proxy.py --model qwen3-coder --port 8050 --filter-windows-tools > /tmp/ollama_proxy.log 2>&1 &
+PROXY_PID=$!
+
+echo "Ollama (pid $OLLAMA_PID) + proxy (pid $PROXY_PID) running. Ctrl-C to stop both."
+wait
 ```
 
-This will start ollama and pre-warm the model immediately, as soon as execution finishes you should be able to start working.
+Make it executable and use it from now on — one command starts the whole stack:
 
-Your LLM engine (ollama) should now be running inside the container at http://localhost:11434 and be bound to host system port 8080.
+```bash
+chmod +x start_llm.sh
+./start_llm.sh
+```
 
-Check if you will be able to see "Ollama is running" via http://<host_system_ip>:8080/
+As soon as execution finishes you should be able to start working (the script pre-warms the model before returning control). To stop everything, just Ctrl-C the terminal running it.
+
+The proxy (`utility/ollama_proxy.py` from this repository) is a small stdlib-only Python script that sits between VS Code BYOM and Ollama. It does three things:
+
+- **Forces all requests to one fixed model** — whatever `model` ID the client sends, it gets rewritten to your wrapper (`qwen3-coder`). This is what makes the thinking presets below possible.
+- **Decodes thinking directives from the BYOM model ID** — a `-nothink` suffix maps to `reasoning_effort=none`, and `-think-low|medium|high|max` map to the matching effort level, injected into the OpenAI-compat request (Ollama's `/v1/chat/completions` ignores `think` but honors `reasoning_effort`).
+- **Optionally strips Windows-native tools** (`--filter-windows-tools`) from chat-completions payloads, so a Linux-sandboxed model never sees PowerShell/cmd tool definitions.
+
+It also duplicates all logs (including crash tracebacks) to a file via `--log-file` (default `ollama_proxy.log`). Useful flags: `--default-effort <level>` sets a baseline effort for requests without a directive suffix, and `--ollama-url` overrides the upstream address (defaults to `http://127.0.0.1:11434`, which is exactly what we want here — Ollama stays on its internal port inside the container).
+
+Your LLM engine (ollama) should now be running inside the container at http://localhost:11434, and the proxy in front of it at http://localhost:8050, bound to host system port 8080.
+
+Check if you will be able to see "Ollama is running" via http://<host_system_ip>:8080/ (the proxy passes GET requests straight through to Ollama).
 
 Now, if you need access from VS Code with Copilot extension or Cursor on another machine, add inbound firewall rule for Windows Firewall on host system:
 
@@ -263,6 +317,33 @@ New-NetFirewallRule -DisplayName "Ollama LAN Access" -Direction Inbound -Protoco
 ```
 
 Note: if you want to use this setup for production data, connecting to compute node from another machine, like development laptop, make sure to restrict the rule above to only local IP address of your laptop, so that no other machine on your internal network can detect and use this locally running LLM without your permission.
+
+**Note:** since Ollama is no longer directly reachable from the host, anything else you had pointing at `:8080` expecting raw Ollama (e.g., `ollama` CLI from another machine) will now hit the proxy — which only forwards POST/GET chat paths, so that's fine for BYOM clients but worth knowing. If you do need raw Ollama externally, see the next section.
+
+#### Optional: also expose raw Ollama to the external network
+
+By default only the proxy is exposed (container 8050 → host 8080) and Ollama's native API stays internal on port 11434. If you need direct access to raw Ollama from outside — e.g., running `ollama` CLI on your laptop against the remote engine, or using a client that speaks only Ollama's native `/api/*` endpoints — make these two optional modifications:
+
+1. **Add a second port binding** in `devcontainer.json` `runArgs`, exposing Ollama's internal port on a *different* host port (8081 here, pick any free one):
+   ```json
+   "runArgs": [
+     "--ipc=host",
+     "--mount=type=bind,src=/usr/lib/wsl/drivers,dst=/usr/lib/wsl/drivers,readonly",
+     "-p", "0.0.0.0:8080:8050",
+     "-p", "0.0.0.0:8081:11434"
+   ]
+   ```
+2. **Add a second firewall rule** on the Windows host for the new port (or extend the existing one to cover both ports):
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama LAN Access (raw)" -Direction Inbound -Protocol TCP -LocalPort 8081 -Action Allow -Profile Domain,Private
+   ```
+
+That's it — no changes to `start_llm.sh` or the proxy are needed. You now have two endpoints:
+
+- `http://<host_system_ip>:8080` — the proxy (BYOM clients, thinking presets)
+- `http://<host_system_ip>:8081` — raw Ollama (native API, remote `ollama` CLI via `OLLAMA_HOST=http://<host_system_ip>:8081 ollama run qwen3-coder "..."`)
+
+Remember to apply the same IP-restriction advice from above to port 8081 as well: raw Ollama has no authentication at all, so exposing it wider than your trusted machine is riskier than exposing the proxy. If you only occasionally need raw access, an even safer alternative is to skip the permanent binding and add it ad-hoc with `docker run`-style port flags or a temporary `socat`/`ssh -L` tunnel from your laptop instead.
 
 The system is now fully configured. The host system's drives remain hidden from the container, leaving the LLM completely restricted to your isolated folder.
 At the same time, LLM execution environment also isolated from host environment. You can try some local prompt now, and while it will run you can verify the GPU status inside the sandbox, in a new terminal within VS Code (`Ctrl+Shift+``):
@@ -296,19 +377,39 @@ This option works best overall. First I've tried this setup with Continue.dev ex
 	"apiType": "chat-completions",
 	"models": [
 		{
-			"id": "qwen3-coder",
-			"name": "Qwen 3.8 27B",
+			"id": "qwen3-coder-nothink",
+			"name": "Qwen 3.8 27B - No thinking (log triage)",
 			"url": "http://192.168.10.10:8080",
 			"toolCalling": true,
 			"vision": false,
-			"maxInputTokens": 64000,
-			"maxOutputTokens": 14000
+			"maxInputTokens": 72000,
+			"maxOutputTokens": 8000
+		},
+		{
+			"id": "qwen3-coder-think-high",
+			"name": "Qwen 3.8 27B - Deep thinking (analysis)",
+			"url": "http://192.168.10.10:8080",
+			"toolCalling": true,
+			"vision": false,
+			"maxInputTokens": 48000,
+			"maxOutputTokens": 32000
+		},
+		{
+			"id": "qwen3-coder-think-medium",
+			"name": "Qwen 3.8 27B - Medium thinking (patching)",
+			"url": "http://192.168.10.10:8080",
+			"toolCalling": true,
+			"vision": false,
+			"maxInputTokens": 62000,
+			"maxOutputTokens": 18000
 		}
 	]
 }
 ```
 
-Make sure to fill in the "id" parameter matching the one you have downloaded in ollama exactly. In this case it's `qwen3-coder` - custom model wrapper we have created. Add endpoint URL (here "http://192.168.10.10:8080") and don't forget to set model context - here sum of "maxInputTokens" and "maxOutputTokens" should be slightly less than total window set in ollama (80000). "Slightly less" is literal here: note that the whole context window of 80K tokens is not fully allocated. There's a headroom of 2K tokens, and that's intentional. LLM prompt results might slightly vary in size and sometimes can grow a bit larger than allocated buffer limits which will truncate the output in best case, or will cause "request body too big" errors on Copilot side, wasting a perfectly fine formulated answer which you will have to re-calculate again from scratch. So leave as is, and in case you will have more headroom, add it to maxInputTokens instead of maxOutputTokens. 14K maxOutputTokens is around the biggest safe value which can be consumed by Copilot without intermittent issues when communicating with Ollama.
+The "id" values here are **not** real Ollama model names — they're directives decoded by the proxy. All three entries point at the same underlying wrapper (`qwen3-coder`), because the proxy rewrites every request's `model` field to it anyway. The suffix is what matters: `-nothink` maps to `reasoning_effort=none` (no hidden reasoning at all — fast, cheap, ideal for triaging logs and quick questions), while `-think-high` and `-think-medium` map to the matching effort levels for deeper analysis and patching work respectively. The proxy also supports `-think-low` and `-think-max` if you want more presets; any ID without a recognized suffix falls through to `--default-effort` (or Ollama's default behavior).
+
+Add endpoint URL (here "http://192.168.10.10:8080" — the host port bound to the proxy's internal 8050) and don't forget to set model context - here sum of "maxInputTokens" and "maxOutputTokens" should be slightly less than total window set in ollama (82000). "Slightly less" is literal here: note that the whole context window of 82K tokens is not fully allocated. There's a headroom of 2K tokens, and that's intentional. LLM prompt results might slightly vary in size and sometimes can grow a bit larger than allocated buffer limits which will truncate the output in best case, or will cause "request body too big" errors on Copilot side, wasting a perfectly fine formulated answer which you will have to re-calculate again from scratch. So leave as is, and in case you will have more headroom, add it to maxInputTokens for non-thinking variants and to maxOutputTokens for thinking ones. Note the per-preset budgets: no-thinking requests need little output room (8K) so they can afford a huge input window (74K); thinking presets reserve more for output because hidden reasoning consumes completion tokens — 32K for deep analysis, 18K for patching. All three sum to 80,000, keeping the same 2K headroom under Ollama's 82K window.
 
 #### Option 2: Cursor extension
 
@@ -322,7 +423,9 @@ Note: This should be possible but I was unable to configure it yet - relevant op
    http://192.168.10.10:8080
    ```
 5. Enter a dummy API key if required (e.g., ollama).
-6. Click Add Model, enter the exact name of your pulled model (e.g., qwen3.8:27b), and toggle it on. Turn off any cloud models you don't intend to use.
+6. Click Add Model, enter the exact name of your pulled model (e.g., qwen3-coder), and toggle it on. Turn off any cloud models you don't intend to use.
+
+Note: since traffic goes through the proxy, Cursor will also benefit from the thinking directives — add extra model entries with IDs like `qwen3-coder-nothink` or `qwen3-coder-think-high` if your client lets you register multiple IDs against the same base URL.
 
 ## Security Analysis
 
@@ -331,7 +434,7 @@ Note: This should be possible but I was unable to configure it yet - relevant op
 The setup implements several security controls:
 - **Isolated Environment**: Container-based sandbox prevents direct access both ways: to host system from container and to container from host system
 - **GPU Isolation**: GPU resources are properly allocated through Docker
-- **Network Isolation**: Limited port exposure (11434 mapped to 8080)
+- **Network Isolation**: Limited port exposure (only the proxy's 8050 mapped to host 8080; Ollama's 11434 stays internal to the container)
 - **User Account Separation**: Dedicated coder user with restricted permissions
 - **Persistent Model Storage**: Models stored in isolated workspace folder
 
