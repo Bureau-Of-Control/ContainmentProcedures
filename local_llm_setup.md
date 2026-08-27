@@ -213,7 +213,7 @@ FROM qwen3.8:27b
 PARAMETER temperature 0.3
 PARAMETER top_p 0.95
 PARAMETER repeat_penalty 1.08
-PARAMETER num_predict 4096
+PARAMETER num_predict -1
 
 # Define explicit behavioral guardrails
 SYSTEM """
@@ -231,7 +231,7 @@ Here is a breakdown of what each `PARAMETER` does and how well they work togethe
 
 `repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases. A value of 1.0 means no penalty, our value is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
 
-`num_predict 4096` - this sets the maximum number of tokens (roughly 3,000 words) the model is allowed to generate in a single response. Our setting (4096) is very generous. It ensures the model has plenty of room to finish long explanations or complex code blocks without getting abruptly cut off.
+`num_predict -1` - this sets the maximum number of tokens the model is allowed to generate in a single response. -1 here means no limit, it makes sense to not limit thinking models with this parameter as it might cause the truncation of thinking process upon reaching this number and cause requests to fail with "Sorry, no response was returned". It ensures the model has room to finish long explanations or complex code blocks without getting abruptly cut off.
 
 And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to 1-2 times a day and it happens now only on complex reasoning tasks. 
 
