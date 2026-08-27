@@ -31,8 +31,11 @@ duplicated to --log-file in addition to the console.
 
 import argparse
 import json
+import os
 import re
+import socket
 import sys
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
@@ -85,6 +88,21 @@ THINK_DIRECTIVE = re.compile(
 )
 
 VALID_EFFORTS = ("none", "low", "medium", "high", "max")
+
+# Per-read timeout (seconds) for the upstream Ollama connection. This is NOT a
+# total deadline: as long as tokens keep flowing, a generation can run for any
+# length. It only bounds how long we wait between chunks — which matters when
+# the CLIENT has gone away (aborted request): without it the handler thread
+# would sit blocked in urlopen() forever, holding its place in Ollama's
+# single-slot queue and starving every new request behind it.
+UPSTREAM_READ_TIMEOUT = float(os.environ.get("PROXY_UPSTREAM_TIMEOUT", "30"))
+
+# How many times to retry a failed upstream connection (Ollama down, socket
+# reset while queued, read timeout with the client still alive) before giving
+# up. Retries only happen BEFORE any response byte has been sent to the
+# client — once streaming starts we cannot re-issue the request.
+UPSTREAM_RETRY_ATTEMPTS = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
+UPSTREAM_RETRY_BACKOFF = float(os.environ.get("PROXY_UPSTREAM_BACKOFF", "1.0"))
 
 
 def think_directive(model_id):
@@ -200,11 +218,85 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
 
     def _send_error_body(self, code, message):
         body = json.dumps({"error": {"message": message}}).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client already gone — nothing to deliver.
+            pass
+
+    def _client_alive(self):
+        """Best-effort check that the client socket still has a connection.
+
+        Returns True when we cannot tell (treat as alive — never drop a live
+        request on a false negative). A non-blocking peek of 1 byte is safe:
+        it does not consume data, and EOF/error means the peer closed or
+        reset the connection.
+        """
+        try:
+            sock = self.connection
+            old_flags = sock.getblocking() if hasattr(sock, "getblocking") else None
+            try:
+                sock.setblocking(False)
+                data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            finally:
+                if old_flags is not None:
+                    sock.setblocking(old_flags)
+            if data == b"":
+                return False  # clean EOF — client closed the connection
+            return True
+        except (BlockingIOError, InterruptedError):
+            return True       # no pending data — normal for an idle keep-alive
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return False      # RST or dead socket
+
+    def _forward_with_retry(self, req_factory):
+        """Open the upstream request, retrying connection-level failures.
+
+        Only called BEFORE any response byte is sent to the client, so a
+        re-issue is safe. Retries cover: Ollama briefly unreachable (restart),
+        connection reset while queued, and per-read timeouts on connect when
+        the client is still alive. (Read timeouts DURING streaming are handled
+        separately in do_POST by simply continuing to read.)
+
+        Returns an open HTTPResponse on success, or None if all attempts
+        failed (an error response has already been sent to the client).
+        """
+        last_exc = None
+        for attempt in range(1, UPSTREAM_RETRY_ATTEMPTS + 1):
+            try:
+                return urllib.request.urlopen(req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
+            except urllib.error.HTTPError as e:
+                # A real HTTP response from Ollama (4xx/5xx) — surface it,
+                # do NOT retry (retrying a 400 just wastes the slot).
+                body = e.read()
+                self.send_response(e.code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return None
+            except (urllib.error.URLError, socket.timeout,
+                    ConnectionError, TimeoutError, OSError) as e:
+                last_exc = e
+                if attempt < UPSTREAM_RETRY_ATTEMPTS and self._client_alive():
+                    delay = UPSTREAM_RETRY_BACKOFF * attempt
+                    print(f"[proxy] upstream error (attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}): "
+                          f"{type(e).__name__}: {e} — retrying in {delay:.1f}s")
+                    time.sleep(delay)
+                else:
+                    reason = ("client gone" if not self._client_alive()
+                              else f"retries exhausted ({UPSTREAM_RETRY_ATTEMPTS})")
+                    print(f"[proxy] giving up on upstream request: "
+                          f"{type(e).__name__}: {e} — {reason}")
+                    break
+        self._send_error_body(502, f"upstream Ollama unreachable after retries: {last_exc}")
+        return None
 
     def do_POST(self):
         # Chunked request bodies are not supported: without a Content-Length
@@ -255,32 +347,59 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             # Not JSON — forward untouched.
             pass
 
-        req = urllib.request.Request(
-            f"{self.ollama_url}{self.path}",
-            data=modified_data,
-            headers=self._forward_headers(),
-            method="POST",
-        )
+        # Rebuild the Request on every attempt: urllib consumes the data
+        # buffer, so a retry needs a fresh object with the same body.
+        def _make_request():
+            return urllib.request.Request(
+                f"{self.ollama_url}{self.path}",
+                data=modified_data,
+                headers=self._forward_headers(),
+                method="POST",
+            )
+
+        response = self._forward_with_retry(_make_request)
+        if response is None:
+            return  # error already delivered to the client
 
         try:
-            with urllib.request.urlopen(req) as response:
-                self.send_response(response.status)
-                for k, v in response.getheaders():
-                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
-                        self.send_header(k, v)
-                self.end_headers()
-
-                # Stream line-by-line so SSE events are never split mid-chunk.
-                for line in response:  # HTTPResponse iterates by lines
-                    if not line.endswith(b"\n"):
-                        line += b"\n"
-                    self.wfile.write(line)
-        except urllib.error.HTTPError as e:
-            body = e.read()
-            self.send_response(e.code)
-            self.send_header("Content-Type", "application/json")
+            self.send_response(response.status)
+            for k, v in response.getheaders():
+                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
+                    self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+
+            # Stream line-by-line so SSE events are never split mid-chunk.
+            while True:
+                try:
+                    line = next(response)  # HTTPResponse iterates by lines
+                except StopIteration:
+                    break
+                except socket.timeout:
+                    # No chunk arrived within UPSTREAM_READ_TIMEOUT. This is
+                    # NORMAL during long first-token latency (thinking models
+                    # can take >30s to start), so if the client is still
+                    # waiting we simply keep reading — the timeout only bounds
+                    # how often we get a chance to notice a dead client.
+                    if self._client_alive():
+                        continue
+                    print(f"[proxy] no upstream data for {UPSTREAM_READ_TIMEOUT:.0f}s "
+                          f"and client gone; aborting to free the Ollama slot")
+                    break
+                if not line.endswith(b"\n"):
+                    line += b"\n"
+                try:
+                    self.wfile.write(line)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected mid-stream. Break out immediately so
+                    # the finally closes the upstream response — that aborts
+                    # Ollama's generation and frees its slot for the next
+                    # request instead of holding it until the model finishes
+                    # a response nobody is reading.
+                    print(f"[proxy] client disconnected mid-stream; "
+                          f"aborting upstream to free the Ollama slot")
+                    break
+        finally:
+            response.close()
 
     def do_GET(self):
         # Pass through GET requests (e.g. /api/tags, /v1/models).
@@ -288,7 +407,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             f"{self.ollama_url}{self.path}", method="GET"
         )
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=UPSTREAM_READ_TIMEOUT) as response:
                 self.send_response(response.status)
                 for k, v in response.getheaders():
                     if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
