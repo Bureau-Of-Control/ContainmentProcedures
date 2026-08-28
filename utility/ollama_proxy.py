@@ -32,8 +32,8 @@ duplicated to --log-file in addition to the console.
 import argparse
 import json
 import os
-import re
 import queue
+import re
 import signal
 import socket
 import sys
@@ -93,18 +93,20 @@ THINK_DIRECTIVE = re.compile(
 
 VALID_EFFORTS = ("none", "low", "medium", "high", "max")
 
-# Per-read timeout (seconds) for the upstream Ollama connection. This is NOT a
-# total deadline: as long as tokens keep flowing, a generation can run for any
-# length. It only bounds how long we wait between chunks — which matters when
-# the CLIENT has gone away (aborted request): without it the handler thread
-# would sit blocked in urlopen() forever, holding its place in Ollama's
-# single-slot queue and starving every new request behind it.
+# Socket timeout (seconds) for the upstream Ollama connection during CONNECT
+# and HEADER phases. Once headers arrive, _iter_upstream_lines switches the
+# socket to blocking mode (no timeout), so long thinking silences in the body
+# phase are simply "no data yet" — client liveness is polled instead. This
+# matters when the CLIENT has gone away (aborted request): without it the
+# handler thread would sit blocked in urlopen() forever, holding its place in
+# Ollama's single-slot queue and starving every new request behind it.
 UPSTREAM_READ_TIMEOUT = float(os.environ.get("PROXY_UPSTREAM_TIMEOUT", "30"))
 
 # How many times to retry a failed upstream connection (Ollama down, socket
-# reset while queued, read timeout with the client still alive) before giving
-# up. Retries only happen BEFORE any response byte has been sent to the
-# client — once streaming starts we cannot re-issue the request.
+# reset while queued) before giving up. Retries only happen BEFORE any response
+# byte has been sent to the client — once streaming starts we cannot re-issue
+# the request. Also bounds kill-and-respawn attempts for non-streaming requests
+# whose reader worker dies before any data arrived (see do_POST).
 UPSTREAM_RETRY_ATTEMPTS = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("PROXY_UPSTREAM_BACKOFF", "1.0"))
 
@@ -430,6 +432,8 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         raw_line = b""
         interrupted = False
         for kind, value in self._iter_upstream_lines(response):
+            if kind == "done":
+                break  # sentinel — upstream stream finished cleanly
             if kind == "error":
                 print(f"[proxy] upstream read error: {type(value).__name__}: {value}")
                 interrupted = True
@@ -483,10 +487,10 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         """Open the upstream request, retrying connection-level failures.
 
         Only called BEFORE any response byte is sent to the client, so a
-        re-issue is safe. Retries cover: Ollama briefly unreachable (restart),
-        connection reset while queued, and per-read timeouts on connect when
-        the client is still alive. (Read timeouts DURING streaming are handled
-        separately in do_POST by simply continuing to read.)
+        re-issue is safe. Retries cover: Ollama briefly unreachable (restart)
+        and connection reset while queued. Body reads DURING streaming are
+        handled separately by _iter_upstream_lines (background worker with no
+        socket timeout + client-liveness polling), so they never surface here.
 
         Returns an open HTTPResponse on success, or None if all attempts
         failed (an error response has already been sent to the client).
@@ -507,14 +511,31 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
 
                     def _open():
                         try:
+                            # Socket timeout must cover the full queue wait +
+                            # header read so the join budget below governs,
+                            # not a premature socket timeout.
                             box["resp"] = _UPSTREAM_OPENER.open(
-                                req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
+                                req_factory(),
+                                timeout=MAX_QUEUE_WAIT + UPSTREAM_READ_TIMEOUT)
                         except BaseException as e:  # noqa: BLE001 — report to main thread
                             box["exc"] = e
 
                     worker = threading.Thread(target=_open, daemon=True)
                     worker.start()
-                    worker.join(MAX_QUEUE_WAIT)
+                    deadline = time.monotonic() + MAX_QUEUE_WAIT
+                    while worker.is_alive():
+                        if not self._client_alive():
+                            # Client gone — abandon our place in the queue and
+                            # free the slot. No error body to send (no one's
+                            # listening).
+                            print(f"[proxy] client disconnected during queue "
+                                  f"wait; abandoning upstream slot")
+                            abort_all_upstreams("client disconnected (queue wait)")
+                            worker.join(timeout=2)
+                            return None
+                        if time.monotonic() > deadline:
+                            break
+                        worker.join(timeout=0.5)
                     if "resp" in box:
                         return box["resp"]
                     if "exc" in box:
@@ -526,8 +547,20 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                     return None
                 return _UPSTREAM_OPENER.open(req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
             except urllib.error.HTTPError as e:
-                # A real HTTP response from Ollama (4xx/5xx) — surface it,
-                # do NOT retry (retrying a 400 just wastes the slot).
+                # Transient server errors (429 / 5xx) — Ollama returns these
+                # when the slot is busy or it aborts a queued request. Retry
+                # with backoff; the long generation will finish and free the
+                # slot. Client errors (4xx other than 429) are permanent —
+                # surface immediately, retrying just wastes time.
+                if e.code == 429 or e.code >= 500:
+                    last_exc = e
+                    if attempt < UPSTREAM_RETRY_ATTEMPTS and self._client_alive():
+                        delay = UPSTREAM_RETRY_BACKOFF * attempt
+                        print(f"[proxy] upstream {e.code} (attempt "
+                              f"{attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        continue
+                # Permanent error, or retries exhausted — surface it.
                 body = e.read()
                 self.send_response(e.code)
                 self.send_header("Content-Type", "application/json")
@@ -615,18 +648,18 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # KEY FIX (long-thinking stall): when the client asks for a
                 # NON-streaming chat completion, Ollama generates the ENTIRE
                 # reply — including all internal thinking tokens — before
-                # sending a single byte back. With a 30s per-read socket
-                # timeout that silence looks like a dead connection and the
-                # request dies (this is exactly what killed the old proxy:
-                # three "TimeoutError" aborts at 30.029s while Ollama was
-                # happily thinking for ~1m44s).
+                # sending a single byte back. That silence in the HEADER phase
+                # is what killed the old proxy: three "TimeoutError" aborts at
+                # 30.029s while Ollama was happily thinking for ~1m44s, and it
+                # would also trip MAX_QUEUE_WAIT on longer thoughts.
                 #
                 # Forcing stream=true makes Ollama send HTTP headers IMMEDIATELY
                 # on request acceptance, so the header phase is always fast and
                 # the long thinking silence then happens in the streaming body
-                # phase — where a read timeout is already tolerated (we just
-                # keep reading while the client is alive). We reassemble the
-                # SSE chunks into the single JSON body the client expects.
+                # phase — where _iter_upstream_lines reads with no socket
+                # timeout (background worker) and only polls client liveness.
+                # We reassemble the SSE chunks into the single JSON body the
+                # client expects.
                 if (self.path.rstrip("/").endswith("/v1/chat/completions")
                         and not payload.get("stream")):
                     payload["stream"] = True
@@ -723,6 +756,8 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # so long thinking silences can't poison the reader; we only
                 # poll client liveness between chunks.
                 for kind, value in self._iter_upstream_lines(response):
+                    if kind == "done":
+                        break  # sentinel — upstream stream finished cleanly
                     if kind == "error":
                         print(f"[proxy] {rid} upstream read error: "
                               f"{type(value).__name__}: {value}")
