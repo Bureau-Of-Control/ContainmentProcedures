@@ -33,10 +33,14 @@ import argparse
 import json
 import os
 import re
+import queue
+import signal
 import socket
 import sys
+import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 import urllib.error
@@ -103,6 +107,62 @@ UPSTREAM_READ_TIMEOUT = float(os.environ.get("PROXY_UPSTREAM_TIMEOUT", "30"))
 # client — once streaming starts we cannot re-issue the request.
 UPSTREAM_RETRY_ATTEMPTS = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("PROXY_UPSTREAM_BACKOFF", "1.0"))
+
+# Max time (seconds) to wait for Ollama's response HEADERS before giving up.
+# This bounds the "queue wait" phase only — NOT generation duration (streaming
+# is unbounded, as always). In our single-model setup Ollama preempts a
+# running task when a new request arrives, so this should almost never fire;
+# it's a safety net against a wedged upstream. 0 disables the limit.
+MAX_QUEUE_WAIT = float(os.environ.get("PROXY_MAX_QUEUE_WAIT", "120"))
+
+# Generous receive buffer for upstream sockets. After a long thinking phase
+# Ollama flushes the entire answer in one burst; a larger SO_RCVBUF lets the
+# kernel absorb it without backpressure stalling our read loop. 4 MB is well
+# within "reasonable" for a local proxy and covers even very long responses.
+UPSTREAM_RCVBUF = int(os.environ.get("PROXY_UPSTREAM_RCVBUF", str(4 * 1024 * 1024)))
+
+
+class _UpstreamHTTPHandler(urllib.request.HTTPHandler):
+    """urllib handler that sets a generous SO_RCVBUF on upstream sockets."""
+
+    def http_open(self, req):
+        resp = super().http_open(req)
+        try:
+            sock = None
+            fp = getattr(resp, "fp", None)
+            if fp is not None:
+                raw = getattr(fp, "raw", None)
+                if raw is not None:
+                    sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UPSTREAM_RCVBUF)
+        except (AttributeError, OSError):
+            pass  # best-effort; never break the request over buffer tuning
+        return resp
+
+
+_UPSTREAM_OPENER = urllib.request.build_opener(_UpstreamHTTPHandler())
+
+# Registry of in-flight upstream connections (for /_abort and graceful
+# shutdown). Thread-safe: only mutated under _ACTIVE_LOCK.
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_CONNECTIONS: dict[str, urllib.response.addinfourl] = {}
+
+
+def abort_all_upstreams(reason):
+    """Close every in-flight upstream connection so Ollama aborts its
+    generation(s) and frees the slot immediately. Returns count closed."""
+    with _ACTIVE_LOCK:
+        conns = list(_ACTIVE_CONNECTIONS.items())
+        _ACTIVE_CONNECTIONS.clear()
+    for rid, resp in conns:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if conns:
+        print(f"[proxy] aborted {len(conns)} upstream connection(s): {reason}")
+    return len(conns)
 
 
 def think_directive(model_id):
@@ -207,6 +267,13 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
     filter_windows_tools_enabled = False
     default_effort = None
 
+    # Generous I/O buffers for the client-facing socket (default wbufsize is
+    # 0 = unbuffered, one syscall per line). A larger write buffer batches
+    # bursty token output into fewer syscalls; we still flush after every SSE
+    # line in the streaming loop so tokens reach VS Code immediately.
+    rbufsize = 1024 * 1024   # 1 MiB read buffer (request bodies)
+    wbufsize = 256 * 1024   # 256 KiB write buffer (response streaming)
+
     def _forward_headers(self):
         # Drop hop-by-hop headers, Host, and Content-Length (urllib recomputes
         # it from the actual body — forwarding the client's value would be
@@ -253,6 +320,165 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError, OSError):
             return False      # RST or dead socket
 
+    def _iter_upstream_lines(self, response, poll_interval=5.0):
+        """Yield upstream body lines while the client stays alive.
+
+        Reads happen in a background worker thread with NO socket read
+        timeout: a long thinking silence is simply "no data yet", and —
+        critically — a buffered reader that times out mid-read gets poisoned
+        (the next read raises OSError('cannot read from timed out object'),
+        which crashed handler threads in the old design). The main loop polls
+        client liveness every poll_interval seconds; if the client is gone it
+        stops consuming, and the caller's finally-block closes the upstream
+        response — aborting Ollama's generation and freeing its slot.
+
+        Yields (kind, value) where kind is 'line' | 'error' | 'done'.
+        """
+        def _clear_read_timeout(resp):
+            # Best-effort: drop the upstream socket read timeout now that
+            # headers have arrived, so thinking silence blocks forever
+            # instead of raising. (addinfourl.fp -> HTTPResponse.fp ->
+            # BufferedReader.raw._sock for plain-HTTP Ollama.)
+            target = resp.fp if hasattr(resp, "fp") else resp
+            try:
+                sock = target.fp.raw._sock  # noqa: SLF001
+                if sock is not None:
+                    sock.settimeout(None)
+            except (AttributeError, OSError):
+                pass  # keep existing timeout; the error path still recovers
+
+        _clear_read_timeout(response)
+
+        q: "queue.Queue" = queue.Queue()
+
+        def _reader():
+            try:
+                for raw in response:  # HTTPResponse iterates by lines
+                    q.put(("line", raw))
+                q.put(("done", None))
+            except BaseException as e:  # noqa: BLE001 — report to main thread
+                q.put(("error", e))
+
+        threading.Thread(target=_reader, daemon=True).start()
+        while True:
+            try:
+                kind, value = q.get(timeout=poll_interval)
+            except queue.Empty:
+                if not self._client_alive():
+                    print(f"[proxy] no upstream data for {poll_interval:.0f}s "
+                          f"and client gone; aborting to free the Ollama slot")
+                    return
+                continue  # still thinking — keep waiting, socket stays healthy
+            yield kind, value
+            if kind in ("done", "error"):
+                return
+
+    def _consume_sse_as_nonstream(self, response):
+        """Drain a forced-streaming upstream SSE body and reassemble it into
+        the single JSON body a non-streaming client expects.
+
+        Used when we rewrote stream=false -> stream=true (see do_POST) so that
+        long thinking phases happen in the streaming phase instead of blocking
+        the header phase. Returns (status, body_bytes, interrupted). On any
+        read error or client disconnect the upstream is aborted (caller's
+        finally closes it); `interrupted` tells the caller whether a fresh
+        re-issue is worth attempting (nothing had been accumulated yet).
+        """
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        finish_reason = None
+        usage = None
+        model_name = self.target_model
+        stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        saw_sse_data = False
+
+        def _accumulate(chunk):
+            nonlocal finish_reason, usage, model_name
+            if not isinstance(chunk, dict):
+                return
+            if chunk.get("model"):
+                model_name = chunk["model"]
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                piece = delta.get("content")
+                if isinstance(piece, str) and piece:
+                    content_parts.append(piece)
+                for tc in delta.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    idx = int(tc.get("index", 0))
+                    slot = tool_calls.setdefault(idx, {"id": "", "type": "function",
+                                                      "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function")
+                    if isinstance(fn, dict):
+                        if fn.get("name"):
+                            slot["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+
+        raw_line = b""
+        interrupted = False
+        for kind, value in self._iter_upstream_lines(response):
+            if kind == "error":
+                print(f"[proxy] upstream read error: {type(value).__name__}: {value}")
+                interrupted = True
+                break
+            line = value.decode("utf-8", "replace").strip()
+            raw_line = value
+            if not line.startswith("data:"):
+                continue  # skip event:/id:/comment/blank lines
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            saw_sse_data = True
+            try:
+                _accumulate(json.loads(data))
+            except ValueError:
+                pass  # tolerate keep-alive or malformed chunks
+
+        aborted = (finish_reason is None and not content_parts
+                   and not tool_calls)
+        if aborted and not saw_sse_data and response.status >= 400:
+            # Ollama answered with a plain error body, not an SSE stream —
+            # surface its real status code instead of masking it as 502.
+            return (response.status,
+                    raw_line or b'{"error": {"message": "upstream error"}}',
+                    False)
+        if aborted:
+            return (502, json.dumps(
+                {"error": {"message": "upstream stream interrupted during "
+                                      "non-streaming reassembly"}},
+                ensure_ascii=False).encode("utf-8"),
+                interrupted)
+
+        message: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        body_obj = {
+            "id": stream_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": finish_reason or "stop"}],
+        }
+        if usage:
+            body_obj["usage"] = usage
+        return (response.status,
+                json.dumps(body_obj, ensure_ascii=False).encode("utf-8"),
+                False)  # completed cleanly — no re-issue needed
+
     def _forward_with_retry(self, req_factory):
         """Open the upstream request, retrying connection-level failures.
 
@@ -268,7 +494,37 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         last_exc = None
         for attempt in range(1, UPSTREAM_RETRY_ATTEMPTS + 1):
             try:
-                return urllib.request.urlopen(req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
+                if MAX_QUEUE_WAIT > 0:
+                    # Overall deadline for getting response HEADERS (the
+                    # "queue wait" phase). urlopen blocks until headers arrive;
+                    # a per-read socket timeout alone would let it stall
+                    # indefinitely across many slow reads. Run in a worker
+                    # thread and join with the remaining budget. If we time
+                    # out, the worker is abandoned (daemon) — Ollama will
+                    # either serve it (harmless; steering preempts it) or drop
+                    # it when its client connection dies.
+                    box: dict = {}
+
+                    def _open():
+                        try:
+                            box["resp"] = _UPSTREAM_OPENER.open(
+                                req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
+                        except BaseException as e:  # noqa: BLE001 — report to main thread
+                            box["exc"] = e
+
+                    worker = threading.Thread(target=_open, daemon=True)
+                    worker.start()
+                    worker.join(MAX_QUEUE_WAIT)
+                    if "resp" in box:
+                        return box["resp"]
+                    if "exc" in box:
+                        raise box["exc"]
+                    # Still no headers after MAX_QUEUE_WAIT — give up.
+                    self._send_error_body(
+                        503, f"upstream did not respond within {MAX_QUEUE_WAIT:.0f}s; "
+                             f"a generation may be holding the slot — steer or /_abort")
+                    return None
+                return _UPSTREAM_OPENER.open(req_factory(), timeout=UPSTREAM_READ_TIMEOUT)
             except urllib.error.HTTPError as e:
                 # A real HTTP response from Ollama (4xx/5xx) — surface it,
                 # do NOT retry (retrying a 400 just wastes the slot).
@@ -299,6 +555,24 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         return None
 
     def do_POST(self):
+        # --- Control endpoint: abort all in-flight upstream requests. ---
+        if self.path.rstrip("/") == "/_abort":
+            n = abort_all_upstreams("manual /_abort request")
+            body = json.dumps({"aborted": n}).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        # --- Request identity + timing (for log correlation with ollama.log). ---
+        rid = uuid.uuid4().hex[:8]
+        t_received = time.monotonic()
+
         # Chunked request bodies are not supported: without a Content-Length
         # we would read 0 bytes and forward an empty body (confusing Ollama
         # 400). Fail loudly instead. VS Code / Node always send Content-Length
@@ -313,6 +587,11 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             self._send_error_body(400, "missing or invalid Content-Length header")
             return
         post_data = self.rfile.read(content_length)
+
+        # True when we forced stream=true upstream for a client that asked for
+        # a single (non-streaming) JSON body — the response must then be
+        # reassembled from SSE chunks before being sent back.
+        forced_stream = False
 
         modified_data = post_data
         try:
@@ -332,6 +611,26 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # Force the model to be exactly what Ollama expects.
                 if "model" in payload:
                     payload["model"] = self.target_model
+
+                # KEY FIX (long-thinking stall): when the client asks for a
+                # NON-streaming chat completion, Ollama generates the ENTIRE
+                # reply — including all internal thinking tokens — before
+                # sending a single byte back. With a 30s per-read socket
+                # timeout that silence looks like a dead connection and the
+                # request dies (this is exactly what killed the old proxy:
+                # three "TimeoutError" aborts at 30.029s while Ollama was
+                # happily thinking for ~1m44s).
+                #
+                # Forcing stream=true makes Ollama send HTTP headers IMMEDIATELY
+                # on request acceptance, so the header phase is always fast and
+                # the long thinking silence then happens in the streaming body
+                # phase — where a read timeout is already tolerated (we just
+                # keep reading while the client is alive). We reassemble the
+                # SSE chunks into the single JSON body the client expects.
+                if (self.path.rstrip("/").endswith("/v1/chat/completions")
+                        and not payload.get("stream")):
+                    payload["stream"] = True
+                    forced_stream = True
 
                 # Strip Windows-native tools for chat completions only.
                 if (self.filter_windows_tools_enabled
@@ -361,45 +660,95 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         if response is None:
             return  # error already delivered to the client
 
-        try:
-            self.send_response(response.status)
-            for k, v in response.getheaders():
-                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
-                    self.send_header(k, v)
-            self.end_headers()
+        t_headers = time.monotonic()
+        queue_wait = t_headers - t_received
+        print(f"[proxy] {rid} headers in {queue_wait:.1f}s "
+              f"(status={response.status})")
 
-            # Stream line-by-line so SSE events are never split mid-chunk.
-            while True:
+        # Register for /_abort and graceful shutdown.
+        with _ACTIVE_LOCK:
+            _ACTIVE_CONNECTIONS[rid] = response
+
+        try:
+            if forced_stream:
+                # We rewrote stream=false -> stream=true upstream (see above).
+                # Drain the whole SSE body — tolerating long thinking silences
+                # via _client_alive() — then deliver ONE JSON body, exactly
+                # what a non-streaming client asked for.
+                #
+                # Kill-and-respawn: if the reader worker dies before ANY data
+                # arrived (poisoned socket, Ollama dropped us mid-queue), we
+                # have sent nothing to the client yet — so re-issue the request
+                # fresh instead of failing it. Bounded by UPSTREAM_RETRY_ATTEMPTS.
+                status = body = None
+                for attempt in range(1, UPSTREAM_RETRY_ATTEMPTS + 1):
+                    status, body, interrupted = self._consume_sse_as_nonstream(response)
+                    if not interrupted or status >= 400:
+                        break  # clean completion, client gone, or real HTTP error
+                    print(f"[proxy] {rid} worker died before any data "
+                          f"(attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — respawning")
+                    with _ACTIVE_LOCK:
+                        _ACTIVE_CONNECTIONS.pop(rid, None)
+                    response.close()  # aborts the dead upstream, frees its slot
+                    if not self._client_alive():
+                        break
+                    time.sleep(UPSTREAM_RETRY_BACKOFF * attempt)
+                    response = self._forward_with_retry(_make_request)
+                    if response is None:
+                        return  # error already delivered to the client
+                    with _ACTIVE_LOCK:
+                        _ACTIVE_CONNECTIONS[rid] = response
                 try:
-                    line = next(response)  # HTTPResponse iterates by lines
-                except StopIteration:
-                    break
-                except socket.timeout:
-                    # No chunk arrived within UPSTREAM_READ_TIMEOUT. This is
-                    # NORMAL during long first-token latency (thinking models
-                    # can take >30s to start), so if the client is still
-                    # waiting we simply keep reading — the timeout only bounds
-                    # how often we get a chance to notice a dead client.
-                    if self._client_alive():
-                        continue
-                    print(f"[proxy] no upstream data for {UPSTREAM_READ_TIMEOUT:.0f}s "
-                          f"and client gone; aborting to free the Ollama slot")
-                    break
-                if not line.endswith(b"\n"):
-                    line += b"\n"
-                try:
-                    self.wfile.write(line)
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected mid-stream. Break out immediately so
-                    # the finally closes the upstream response — that aborts
-                    # Ollama's generation and frees its slot for the next
-                    # request instead of holding it until the model finishes
-                    # a response nobody is reading.
-                    print(f"[proxy] client disconnected mid-stream; "
+                    print(f"[proxy] {rid} client gone before final body; "
                           f"aborting upstream to free the Ollama slot")
-                    break
+            else:
+                self.send_response(response.status)
+                for k, v in response.getheaders():
+                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
+                        self.send_header(k, v)
+                self.end_headers()
+
+            if forced_stream:
+                pass  # body already delivered above as a single JSON response
+            else:
+                # Stream line-by-line so SSE events are never split mid-chunk.
+                # Reads happen in the background worker (no socket timeout),
+                # so long thinking silences can't poison the reader; we only
+                # poll client liveness between chunks.
+                for kind, value in self._iter_upstream_lines(response):
+                    if kind == "error":
+                        print(f"[proxy] {rid} upstream read error: "
+                              f"{type(value).__name__}: {value}")
+                        break
+                    line = value
+                    if not line.endswith(b"\n"):
+                        line += b"\n"
+                    try:
+                        self.wfile.write(line)
+                        self.wfile.flush()  # deliver each SSE chunk immediately
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        # Client disconnected mid-stream. Break out immediately so
+                        # the finally closes the upstream response — that aborts
+                        # Ollama's generation and frees its slot for the next
+                        # request instead of holding it until the model finishes
+                        # a response nobody is reading.
+                        print(f"[proxy] {rid} client disconnected mid-stream; "
+                              f"aborting upstream to free the Ollama slot")
+                        break
         finally:
+            with _ACTIVE_LOCK:
+                _ACTIVE_CONNECTIONS.pop(rid, None)
             response.close()
+            total = time.monotonic() - t_received
+            print(f"[proxy] {rid} done in {total:.1f}s "
+                  f"(queue_wait={t_headers - t_received:.1f}s)")
 
     def do_GET(self):
         # Pass through GET requests (e.g. /api/tags, /v1/models).
@@ -407,7 +756,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             f"{self.ollama_url}{self.path}", method="GET"
         )
         try:
-            with urllib.request.urlopen(req, timeout=UPSTREAM_READ_TIMEOUT) as response:
+            with _UPSTREAM_OPENER.open(req, timeout=UPSTREAM_READ_TIMEOUT) as response:
                 self.send_response(response.status)
                 for k, v in response.getheaders():
                     if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
@@ -459,6 +808,24 @@ def main():
     # Let handler threads die with the process instead of blocking shutdown
     # on a stuck client connection.
     server.daemon_threads = True
+
+    # Graceful shutdown: on SIGTERM/SIGINT, actively close every in-flight
+    # upstream connection so Ollama aborts its generation(s) immediately and
+    # frees the slot — instead of letting daemon threads die while Ollama
+    # keeps generating for a dead client until it notices the RST.
+    _shutdown_started = {"flag": False}
+
+    def _handle_shutdown(signum, frame):
+        if _shutdown_started["flag"]:
+            return  # second Ctrl-C — let the default handler kill us hard
+        _shutdown_started["flag"] = True
+        print(f"\n[proxy] signal {signum} received — aborting upstreams and shutting down")
+        abort_all_upstreams(f"signal {signum}")
+        # shutdown() must be called from a different thread than serve_forever.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
     print(f"Ollama VS Code BYOM proxy running on 0.0.0.0:{args.port}")
     print(f"  -> backend:      {RewriteProxyHandler.ollama_url}")
     print(f"  -> target model: {args.model}")
