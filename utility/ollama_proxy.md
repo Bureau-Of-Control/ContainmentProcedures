@@ -115,19 +115,83 @@ The proxy handles this in `_forward_with_retry`:
   returns these when the slot is busy or it aborts a queued request. Permanent
   `4xx` errors surface immediately.
 
+**Two distinct busy-slot behaviors observed from Ollama:**
+
+1. *Hard reject* — Ollama answers an overlapping request with a header-phase
+   `503`/`429`. Handled by the patient-retry loop (see below).
+2. *Silent queue* — Ollama **accepts** the request and queues it behind the
+   running generation, sending no headers at all until the slot frees. This is
+   what happens for VS Code context-compaction requests arriving mid-generation.
+   The `MAX_QUEUE_WAIT` deadline bounds this wait; if it fires, the proxy logs
+   `[proxy] upstream did not respond within Ns — request was likely queued
+   behind an in-flight generation (single slot)` and surfaces a 503.
+
+Because case 2 can legitimately last longer than a short generation, the
+default `MAX_QUEUE_WAIT` is **300s** (kept at/under undici's default 300s
+headers timeout so the client gives up first if it wants to). The wait loop
+polls client liveness every 0.5s and bails early when the client leaves, so a
+generous deadline costs nothing in that case.
+
 ### Kill-and-respawn (non-streaming)
 
 If the reader worker dies *before any data arrived* (poisoned socket, Ollama
 dropped us mid-queue), nothing has been sent to the client yet — so the proxy
 re-issues the request fresh, bounded by `UPSTREAM_RETRY_ATTEMPTS`.
 
+### Auto-recovery from a wedged slot
+
+With `OLLAMA_NUM_PARALLEL=1`, an abandoned generation can hold the only slot
+so that every later request queues until `MAX_QUEUE_WAIT` and fails — even
+after Ollama itself has recovered. The proxy tracks consecutive failed
+upstream attempts (every failure path in `_forward_with_retry`: deadline
+exceeded, permanent error, retries exhausted). Once the streak reaches
+`RECOVERY_FAIL_THRESHOLD`, it proactively calls `abort_all_upstreams()` to free
+any wedged slot — re-establishing a clean connection with Ollama. A successful
+request resets the streak. Current streak is visible via `GET /_health`.
+
+### Keep-alive pings during deep thinking (client idle-timeout protection)
+
+During deep thinking or context compaction, Ollama can emit **no bytes for
+minutes**. A client with an idle timeout (VS Code ~150s) then closes its side
+of the connection; the proxy sees EOF, aborts the in-flight generation to free
+the slot — and the answer is lost. This is *not* a proxy-side socket timeout
+(body reads are already unbounded); it's the **client** giving up on us.
+
+The fix: while the client stays alive but Ollama is silent, `_iter_upstream_lines`
+yields a `ping` sentinel every `KEEPALIVE_INTERVAL` seconds and the streaming
+loop writes an SSE comment line (`: keep-alive`). Comment lines are ignored by
+conforming SSE parsers (so the stream stays well-formed) but they reset the
+client's idle timer, keeping VS Code connected while Ollama works. The
+non-streaming reassembler skips `ping` sentinels safely.
+
+### Patient retry for header-phase "slot busy" 503s
+
+Keep-alive pings only fire **after** response headers arrive (body phase). A
+rarer failure is a hard `429`/`5xx` in the **header phase**: VS Code abandons a
+stalled prior request, re-issues an overlapping one, and Ollama — still busy on
+the single slot — rejects it with a 503. The fast-retry loop (bounded by
+`UPSTREAM_RETRY_ATTEMPTS`) handles the quick cases; if those are exhausted but
+the client is *still waiting*, `_forward_with_retry_inner` enters a **patient
+retry**: it re-issues on a slow cadence (`BUSY_RETRY_INTERVAL`) until the slot
+frees, bounded by a total budget (`BUSY_RETRY_BUDGET`).
+
+Two safety properties:
+
+- The budget stays well under the client's idle timeout (~150s for VS Code), so
+  we never hold a live client past its patience.
+- If the client leaves mid-wait, the proxy stops waiting **without** calling
+  `abort_all_upstreams()` — the busy slot belongs to *another* connection's
+  generation (possibly a live one) and must be left alone; it frees itself when
+  that generation finishes.
+
 ## Control & observability
 
 | Feature | Detail |
 |---------|--------|
+| `GET /_health` | Proxy liveness probe — does **not** touch Ollama, so it works even when the upstream is wedged. Returns JSON: `{"status":"ok","active_upstreams":N,"fail_streak":M,"recovery_threshold":K}`. Handy for monitoring or auto-restart scripts. |
 | `POST /_abort` | Closes **all** in-flight upstream connections → Ollama aborts its generation(s) and frees the slot immediately. Returns how many were closed. |
 | Graceful shutdown | On SIGTERM/SIGINT, actively closes every in-flight upstream (frees the slot) then shuts down the server. Second Ctrl-C kills hard. |
-| Per-request log | Each request gets an 8-hex `rid`; logs show header/queue-wait time and total time, e.g. `[proxy] 31cc7ffe headers in 65.7s (status=200)` … `[proxy] 31cc7ffe done in 98.2s`. |
+| Per-request log | Each request gets an 8-hex `rid`; logs show header/queue-wait time and total time, e.g. `[2026-08-28 14:03:11] [proxy] 31cc7ffe headers in 65.7s (status=200)` … `[2026-08-28 14:05:19] [proxy] 31cc7ffe done in 98.2s`. Every log line is prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp for easy correlation across interleaved requests. |
 | Crash tracebacks | `sys.excepthook` + a tee'd stdout/stderr write full tracebacks to the log file, flushed immediately so they survive a crash. |
 | GET passthrough | `GET` requests (e.g. `/v1/models`, `/api/tags`) pass through unchanged. |
 
@@ -140,8 +204,12 @@ All have sane defaults; set them in the environment before starting the proxy.
 | `PROXY_UPSTREAM_TIMEOUT` | `30` | Socket timeout (s) for connect + header phase. Body reads are unbounded (see above). |
 | `PROXY_UPSTREAM_RETRIES` | `3` | Max upstream attempts (connection failures, transient 429/5xx, kill-and-respawn). |
 | `PROXY_UPSTREAM_BACKOFF` | `1.0` | Base backoff (s) between retries; multiplied by attempt number. |
-| `PROXY_MAX_QUEUE_WAIT` | `120` | Max seconds to wait for response headers while queued behind a running generation. `0` disables the limit. |
+| `PROXY_MAX_QUEUE_WAIT` | `300` | Max seconds to wait for response headers while queued behind a running generation (Ollama silently queues overlapping requests instead of rejecting them). Keep at/under the client's headers timeout (undici default 300s); the loop bails early if the client leaves. `0` disables the limit. |
 | `PROXY_UPSTREAM_RCVBUF` | `4194304` (4 MiB) | `SO_RCVBUF` on upstream sockets — absorbs Ollama's post-thinking burst without backpressure stalling reads. |
+| `PROXY_RECOVERY_FAILS` | `3` | Consecutive failed upstream attempts before the proxy aborts all in-flight upstreams to free a wedged Ollama slot (auto-recovery). |
+| `PROXY_KEEPALIVE_INTERVAL` | `15` | Seconds of upstream silence before emitting an SSE keep-alive ping (`: keep-alive`) to reset the client's idle timer during deep thinking. Must be well under the client's idle timeout (~150s for VS Code). `0` disables pings. |
+| `PROXY_BUSY_RETRY_BUDGET` | `120` | Total seconds (header phase) the proxy keeps re-issuing a request after fast retries are exhausted, waiting for a busy single slot to free up. Keep under the client's idle timeout (~150s). `0` disables patient retry (surface the 429/5xx immediately). |
+| `PROXY_BUSY_RETRY_INTERVAL` | `30` | Seconds between patient-retry attempts while waiting for the slot to free. |
 
 ## Suggested Ollama environment
 

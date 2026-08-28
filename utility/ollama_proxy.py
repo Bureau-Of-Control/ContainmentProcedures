@@ -110,18 +110,46 @@ UPSTREAM_READ_TIMEOUT = float(os.environ.get("PROXY_UPSTREAM_TIMEOUT", "30"))
 UPSTREAM_RETRY_ATTEMPTS = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
 UPSTREAM_RETRY_BACKOFF = float(os.environ.get("PROXY_UPSTREAM_BACKOFF", "1.0"))
 
+# Patient retry for "slot busy" responses (429 / 5xx) in the HEADER phase.
+# Ollama runs single-slot here; when a previous generation is still finishing
+# and an overlapping request arrives, it rejects the new one with 503. Rather
+# than surfacing that to VS Code immediately, keep the client waiting and
+# re-issue until the slot frees up. Bounded by a total budget (kept under VS
+# Code's ~150s idle timeout — beyond that it disconnects regardless) and an
+# interval between attempts; aborted early if the client leaves. 0 disables
+# patient retry (falls back to surfacing the error right away).
+BUSY_RETRY_BUDGET = float(os.environ.get("PROXY_BUSY_RETRY_BUDGET", "120"))
+BUSY_RETRY_INTERVAL = float(os.environ.get("PROXY_BUSY_RETRY_INTERVAL", "30"))
+
 # Max time (seconds) to wait for Ollama's response HEADERS before giving up.
 # This bounds the "queue wait" phase only — NOT generation duration (streaming
-# is unbounded, as always). In our single-model setup Ollama preempts a
-# running task when a new request arrives, so this should almost never fire;
-# it's a safety net against a wedged upstream. 0 disables the limit.
-MAX_QUEUE_WAIT = float(os.environ.get("PROXY_MAX_QUEUE_WAIT", "120"))
+# is unbounded, as always). With a single slot, Ollama ACCEPTS an overlapping
+# request and silently queues it behind the running generation (observed: a
+# compaction request queued 120s+ behind a 4m28s generation), so this deadline
+# must comfortably exceed typical long-generation durations or we fail the
+# request with a bare 503 while the slot frees up moments later. The wait loop
+# polls client liveness every 0.5s and bails early if the client leaves, so a
+# generous value costs nothing when the client's own header timeout is shorter.
+# Keep it at/under the client's headers timeout (undici default: 300s).
+# 0 disables the limit.
+MAX_QUEUE_WAIT = float(os.environ.get("PROXY_MAX_QUEUE_WAIT", "300"))
 
 # Generous receive buffer for upstream sockets. After a long thinking phase
 # Ollama flushes the entire answer in one burst; a larger SO_RCVBUF lets the
 # kernel absorb it without backpressure stalling our read loop. 4 MB is well
 # within "reasonable" for a local proxy and covers even very long responses.
 UPSTREAM_RCVBUF = int(os.environ.get("PROXY_UPSTREAM_RCVBUF", str(4 * 1024 * 1024)))
+
+# Keep-alive ping interval (seconds) for the CLIENT-facing SSE stream. During
+# deep thinking / context compaction Ollama can emit no bytes for minutes; a
+# client with an idle timeout (VS Code ~150s) will then close its connection,
+# which makes us abort the in-flight generation and lose the answer. Emitting
+# an SSE comment line (`: keep-alive`) every KEEPALIVE_INTERVAL seconds of
+# upstream silence resets the client's idle timer so it stays connected while
+# Ollama works. Comment lines are ignored by conforming SSE parsers, so they
+# never corrupt the stream. 0 disables pings. Must be well under the client's
+# idle timeout (15s is safely below typical 30-150s limits without spamming).
+KEEPALIVE_INTERVAL = float(os.environ.get("PROXY_KEEPALIVE_INTERVAL", "15"))
 
 
 class _UpstreamHTTPHandler(urllib.request.HTTPHandler):
@@ -150,6 +178,51 @@ _UPSTREAM_OPENER = urllib.request.build_opener(_UpstreamHTTPHandler())
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_CONNECTIONS: dict[str, urllib.response.addinfourl] = {}
 
+# --- Auto-recovery from a wedged upstream ---------------------------------
+# With OLLAMA_NUM_PARALLEL=1 a single abandoned generation can hold the only
+# slot, so every later request queues until MAX_QUEUE_WAIT and fails — even
+# after Ollama itself recovers. We track consecutive failed requests; once the
+# streak crosses a threshold we proactively abort ALL in-flight upstreams to
+# free any wedged slot (the "re-establish connectivity with Ollama" path). A
+# successful request resets the streak.
+_UPSTREAM_FAIL_STREAK = 0
+_UPSTREAM_FAIL_LOCK = threading.Lock()
+RECOVERY_FAIL_THRESHOLD = int(os.environ.get("PROXY_RECOVERY_FAILS", "3"))
+
+
+def _log(msg: str) -> None:
+    """Emit one timestamped [proxy] log line.
+
+    Every proxy log entry is prefixed with a local date+time so that entries
+    from different requests (and restarts) can be correlated in the log file
+    without guessing at ordering. stdout is tee'd to --log-file, so this lands
+    on both the console and disk.
+    """
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [proxy] {msg}")
+
+
+def _note_upstream_failure():
+    """Record a failed upstream attempt; returns True if recovery (abort-all)
+    should be triggered this time."""
+    global _UPSTREAM_FAIL_STREAK
+    with _UPSTREAM_FAIL_LOCK:
+        _UPSTREAM_FAIL_STREAK += 1
+        streak = _UPSTREAM_FAIL_STREAK
+    if streak >= RECOVERY_FAIL_THRESHOLD:
+        _log(f"{streak} consecutive upstream failures — "
+             f"aborting in-flight upstreams to free any wedged Ollama slot")
+        abort_all_upstreams("auto-recovery after repeated failures")
+        return True
+    return False
+
+
+def _note_upstream_success():
+    global _UPSTREAM_FAIL_STREAK
+    with _UPSTREAM_FAIL_LOCK:
+        if _UPSTREAM_FAIL_STREAK:
+            _log(f"upstream recovered (was {_UPSTREAM_FAIL_STREAK} failed in a row)")
+        _UPSTREAM_FAIL_STREAK = 0
+
 
 def abort_all_upstreams(reason):
     """Close every in-flight upstream connection so Ollama aborts its
@@ -163,7 +236,7 @@ def abort_all_upstreams(reason):
         except Exception:
             pass
     if conns:
-        print(f"[proxy] aborted {len(conns)} upstream connection(s): {reason}")
+        _log(f"aborted {len(conns)} upstream connection(s): {reason}")
     return len(conns)
 
 
@@ -304,9 +377,18 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         request on a false negative). A non-blocking peek of 1 byte is safe:
         it does not consume data, and EOF/error means the peer closed or
         reset the connection.
+
+        CRITICAL: this probe must NEVER raise. It runs inside the request
+        path (queue-wait join loop, streaming liveness poll); an uncaught
+        exception here used to escape as AttributeError ('NoneType' ... 'peek')
+        and kill the handler thread mid-flight, wedging the proxy. So we guard
+        a None/closed socket and swallow every other error, defaulting to a
+        safe answer (dead -> abort upstream; unknown -> alive).
         """
+        sock = self.connection
+        if sock is None:
+            return False  # handler already torn down — treat as gone
         try:
-            sock = self.connection
             old_flags = sock.getblocking() if hasattr(sock, "getblocking") else None
             try:
                 sock.setblocking(False)
@@ -314,13 +396,11 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             finally:
                 if old_flags is not None:
                     sock.setblocking(old_flags)
-            if data == b"":
-                return False  # clean EOF — client closed the connection
-            return True
+            return data != b""  # b"" == clean EOF — client closed the connection
         except (BlockingIOError, InterruptedError):
             return True       # no pending data — normal for an idle keep-alive
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            return False      # RST or dead socket
+        except Exception:     # noqa: BLE001 — a probe must never raise into the request path
+            return False      # RST / dead / closed socket — treat as gone
 
     def _iter_upstream_lines(self, response, poll_interval=5.0):
         """Yield upstream body lines while the client stays alive.
@@ -334,7 +414,13 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         stops consuming, and the caller's finally-block closes the upstream
         response — aborting Ollama's generation and freeing its slot.
 
-        Yields (kind, value) where kind is 'line' | 'error' | 'done'.
+        While the client stays alive but Ollama is silent (deep thinking /
+        context compaction), a 'ping' sentinel is yielded every
+        KEEPALIVE_INTERVAL seconds so the caller can emit an SSE keep-alive to
+        reset the client's idle timer and prevent it from dropping us mid-
+        generation.
+
+        Yields (kind, value) where kind is 'line' | 'error' | 'done' | 'ping'.
         """
         def _clear_read_timeout(resp):
             # Best-effort: drop the upstream socket read timeout now that
@@ -362,15 +448,27 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 q.put(("error", e))
 
         threading.Thread(target=_reader, daemon=True).start()
+        last_activity = time.monotonic()
         while True:
             try:
                 kind, value = q.get(timeout=poll_interval)
             except queue.Empty:
                 if not self._client_alive():
-                    print(f"[proxy] no upstream data for {poll_interval:.0f}s "
-                          f"and client gone; aborting to free the Ollama slot")
+                    _log(f"no upstream data for {poll_interval:.0f}s "
+                         f"and client gone; aborting to free the Ollama slot")
                     return
-                continue  # still thinking — keep waiting, socket stays healthy
+                # Still thinking / compacting — keep waiting, socket stays healthy.
+                # But if we've been silent long enough that a client with an idle
+                # timeout (VS Code ~150s) would drop us, emit a keep-alive ping so
+                # the caller can reset the client's timer and keep the connection
+                # alive while Ollama works. Without this, VS Code closes its side
+                # mid-generation, we see EOF, abort upstream, and lose the answer.
+                if (KEEPALIVE_INTERVAL > 0
+                        and (time.monotonic() - last_activity) >= KEEPALIVE_INTERVAL):
+                    yield ("ping", None)
+                    last_activity = time.monotonic()
+                continue
+            last_activity = time.monotonic()
             yield kind, value
             if kind in ("done", "error"):
                 return
@@ -435,9 +533,11 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             if kind == "done":
                 break  # sentinel — upstream stream finished cleanly
             if kind == "error":
-                print(f"[proxy] upstream read error: {type(value).__name__}: {value}")
+                _log(f"upstream read error: {type(value).__name__}: {value}")
                 interrupted = True
                 break
+            if kind == "ping":
+                continue  # keep-alive sentinel — nothing to accumulate
             line = value.decode("utf-8", "replace").strip()
             raw_line = value
             if not line.startswith("data:"):
@@ -484,6 +584,19 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 False)  # completed cleanly — no re-issue needed
 
     def _forward_with_retry(self, req_factory):
+        """Open the upstream request (see _forward_with_retry_inner), and feed
+        the outcome into the auto-recovery tracker: a failure increments the
+        consecutive-failure streak (triggering an abort-all once it crosses
+        RECOVERY_FAIL_THRESHOLD to free any wedged Ollama slot); a success
+        resets it."""
+        resp = self._forward_with_retry_inner(req_factory)
+        if resp is None:
+            _note_upstream_failure()
+        else:
+            _note_upstream_success()
+        return resp
+
+    def _forward_with_retry_inner(self, req_factory):
         """Open the upstream request, retrying connection-level failures.
 
         Only called BEFORE any response byte is sent to the client, so a
@@ -528,8 +641,8 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                             # Client gone — abandon our place in the queue and
                             # free the slot. No error body to send (no one's
                             # listening).
-                            print(f"[proxy] client disconnected during queue "
-                                  f"wait; abandoning upstream slot")
+                            _log("client disconnected during queue "
+                                 "wait; abandoning upstream slot")
                             abort_all_upstreams("client disconnected (queue wait)")
                             worker.join(timeout=2)
                             return None
@@ -540,7 +653,14 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                         return box["resp"]
                     if "exc" in box:
                         raise box["exc"]
-                    # Still no headers after MAX_QUEUE_WAIT — give up.
+                    # Still no headers after MAX_QUEUE_WAIT — give up. Log it:
+                    # this path previously emitted a bare 503 with zero markers,
+                    # which made "queued behind a long generation" indistinguishable
+                    # from other failures in the log.
+                    _log(f"upstream did not respond within "
+                         f"{MAX_QUEUE_WAIT:.0f}s — request was likely queued "
+                         f"behind an in-flight generation (single slot); "
+                         f"surfacing 503 to client")
                     self._send_error_body(
                         503, f"upstream did not respond within {MAX_QUEUE_WAIT:.0f}s; "
                              f"a generation may be holding the slot — steer or /_abort")
@@ -554,13 +674,49 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # surface immediately, retrying just wastes time.
                 if e.code == 429 or e.code >= 500:
                     last_exc = e
+                    # Single-slot "busy" case: Ollama rejects an overlapping
+                    # request with a hard 5xx while a previous generation is
+                    # still finishing. This is the common failure, so it gets
+                    # its own handler (independent of the fast-retry attempt
+                    # count). Quick backoff first; if that doesn't clear it and
+                    # the client is still waiting, fall to a slow patient retry
+                    # until the slot frees — bounded by a total budget (kept
+                    # under the client's ~150s idle timeout) and aborted early
+                    # if the client leaves.
                     if attempt < UPSTREAM_RETRY_ATTEMPTS and self._client_alive():
                         delay = UPSTREAM_RETRY_BACKOFF * attempt
-                        print(f"[proxy] upstream {e.code} (attempt "
-                              f"{attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — retrying in {delay:.1f}s")
+                        _log(f"upstream {e.code} (attempt "
+                             f"{attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — retrying in {delay:.1f}s")
                         time.sleep(delay)
                         continue
-                # Permanent error, or retries exhausted — surface it.
+                    if BUSY_RETRY_BUDGET > 0 and self._client_alive():
+                        deadline = time.monotonic() + BUSY_RETRY_BUDGET
+                        _log(f"upstream {e.code} — slot busy; patient "
+                             f"retry up to {BUSY_RETRY_BUDGET:.0f}s (every "
+                             f"{BUSY_RETRY_INTERVAL:.0f}s) while client waits")
+                        while time.monotonic() < deadline:
+                            if not self._client_alive():
+                                # Our client left. The busy slot belongs to
+                                # another connection's generation — leave it
+                                # alone (it may be a live one) and just stop
+                                # waiting; it will free up on its own.
+                                _log("client left during patient retry; stopping wait")
+                                return None
+                            time.sleep(BUSY_RETRY_INTERVAL)
+                            try:
+                                resp = _UPSTREAM_OPENER.open(
+                                    req_factory(), timeout=MAX_QUEUE_WAIT + UPSTREAM_READ_TIMEOUT)
+                                _log(f"patient retry succeeded (status={resp.status})")
+                                return resp
+                            except urllib.error.HTTPError as e2:
+                                last_exc = e2  # still busy — keep waiting
+                            except (urllib.error.URLError, socket.timeout,
+                                    ConnectionError, TimeoutError, OSError) as e2:
+                                last_exc = e2  # transient — keep waiting
+                        _log(f"patient retry budget ({BUSY_RETRY_BUDGET:.0f}s) "
+                             f"exhausted on {last_exc}")
+                    break  # permanent error, or retries+budget exhausted
+                # Permanent error (4xx other than 429) — surface it.
                 body = e.read()
                 self.send_response(e.code)
                 self.send_header("Content-Type", "application/json")
@@ -575,14 +731,14 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 last_exc = e
                 if attempt < UPSTREAM_RETRY_ATTEMPTS and self._client_alive():
                     delay = UPSTREAM_RETRY_BACKOFF * attempt
-                    print(f"[proxy] upstream error (attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}): "
-                          f"{type(e).__name__}: {e} — retrying in {delay:.1f}s")
+                    _log(f"upstream error (attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}): "
+                         f"{type(e).__name__}: {e} — retrying in {delay:.1f}s")
                     time.sleep(delay)
                 else:
                     reason = ("client gone" if not self._client_alive()
                               else f"retries exhausted ({UPSTREAM_RETRY_ATTEMPTS})")
-                    print(f"[proxy] giving up on upstream request: "
-                          f"{type(e).__name__}: {e} — {reason}")
+                    _log(f"giving up on upstream request: "
+                         f"{type(e).__name__}: {e} — {reason}")
                     break
         self._send_error_body(502, f"upstream Ollama unreachable after retries: {last_exc}")
         return None
@@ -638,8 +794,8 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                     effort = think_directive(requested) or self.default_effort
                     if effort:
                         payload["reasoning_effort"] = effort
-                        print(f"[proxy] thinking directive from {requested!r} "
-                              f"-> reasoning_effort={effort}")
+                        _log(f"thinking directive from {requested!r} "
+                             f"-> reasoning_effort={effort}")
 
                 # Force the model to be exactly what Ollama expects.
                 if "model" in payload:
@@ -670,7 +826,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                         and self.path.rstrip("/").endswith("/v1/chat/completions")):
                     removed = filter_windows_tools(payload)
                     if removed:
-                        print(f"[proxy] filtered {removed} Windows tool(s)")
+                        _log(f"filtered {removed} Windows tool(s)")
 
             # ensure_ascii=False keeps non-ASCII log content byte-for-byte
             # instead of inflating it into \uXXXX escapes; output is UTF-8.
@@ -695,8 +851,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
 
         t_headers = time.monotonic()
         queue_wait = t_headers - t_received
-        print(f"[proxy] {rid} headers in {queue_wait:.1f}s "
-              f"(status={response.status})")
+        _log(f"{rid} headers in {queue_wait:.1f}s (status={response.status})")
 
         # Register for /_abort and graceful shutdown.
         with _ACTIVE_LOCK:
@@ -716,10 +871,16 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 status = body = None
                 for attempt in range(1, UPSTREAM_RETRY_ATTEMPTS + 1):
                     status, body, interrupted = self._consume_sse_as_nonstream(response)
-                    if not interrupted or status >= 400:
-                        break  # clean completion, client gone, or real HTTP error
-                    print(f"[proxy] {rid} worker died before any data "
-                          f"(attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — respawning")
+                    if not interrupted:
+                        # Clean completion, client gone, or a real HTTP error from
+                        # upstream (all of which return interrupted=False). Only an
+                        # interrupted reassembly — reader worker died before anything
+                        # usable arrived — is safe to re-issue. (Note: the interrupted
+                        # path returns status 502, so a `status >= 400` guard here
+                        # would make the respawn below unreachable.)
+                        break
+                    _log(f"{rid} worker died before any data "
+                         f"(attempt {attempt}/{UPSTREAM_RETRY_ATTEMPTS}) — respawning")
                     with _ACTIVE_LOCK:
                         _ACTIVE_CONNECTIONS.pop(rid, None)
                     response.close()  # aborts the dead upstream, frees its slot
@@ -739,8 +900,8 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.write(body)
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    print(f"[proxy] {rid} client gone before final body; "
-                          f"aborting upstream to free the Ollama slot")
+                    _log(f"{rid} client gone before final body; "
+                         f"aborting upstream to free the Ollama slot")
             else:
                 self.send_response(response.status)
                 for k, v in response.getheaders():
@@ -759,9 +920,23 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                     if kind == "done":
                         break  # sentinel — upstream stream finished cleanly
                     if kind == "error":
-                        print(f"[proxy] {rid} upstream read error: "
-                              f"{type(value).__name__}: {value}")
+                        _log(f"{rid} upstream read error: "
+                             f"{type(value).__name__}: {value}")
                         break
+                    if kind == "ping":
+                        # Upstream is silent (thinking/compacting) but the client
+                        # is still connected. Emit an SSE comment line — ignored by
+                        # conforming parsers, but it resets the client's idle timer
+                        # so VS Code doesn't drop us mid-generation and force Ollama
+                        # to abort a perfectly good in-flight answer.
+                        try:
+                            self.wfile.write(b": keep-alive\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            _log(f"{rid} client gone during keep-alive; "
+                                 f"aborting upstream to free the Ollama slot")
+                            break
+                        continue
                     line = value
                     if not line.endswith(b"\n"):
                         line += b"\n"
@@ -774,18 +949,40 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                         # Ollama's generation and frees its slot for the next
                         # request instead of holding it until the model finishes
                         # a response nobody is reading.
-                        print(f"[proxy] {rid} client disconnected mid-stream; "
-                              f"aborting upstream to free the Ollama slot")
+                        _log(f"{rid} client disconnected mid-stream; "
+                             f"aborting upstream to free the Ollama slot")
                         break
         finally:
             with _ACTIVE_LOCK:
                 _ACTIVE_CONNECTIONS.pop(rid, None)
-            response.close()
+            if response is not None:
+                response.close()
             total = time.monotonic() - t_received
-            print(f"[proxy] {rid} done in {total:.1f}s "
-                  f"(queue_wait={t_headers - t_received:.1f}s)")
+            _log(f"{rid} done in {total:.1f}s "
+                 f"(queue_wait={t_headers - t_received:.1f}s)")
 
     def do_GET(self):
+        # Proxy liveness endpoint — does NOT touch Ollama, so it works even
+        # when the upstream is wedged. Handy for monitoring / auto-restart:
+        #   curl http://localhost:8050/_health
+        if self.path == "/_health":
+            with _ACTIVE_LOCK:
+                active = len(_ACTIVE_CONNECTIONS)
+            with _UPSTREAM_FAIL_LOCK:
+                streak = _UPSTREAM_FAIL_STREAK
+            payload = json.dumps({
+                "status": "ok",
+                "active_upstreams": active,
+                "fail_streak": streak,
+                "recovery_threshold": RECOVERY_FAIL_THRESHOLD,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         # Pass through GET requests (e.g. /api/tags, /v1/models).
         req = urllib.request.Request(
             f"{self.ollama_url}{self.path}", method="GET"
@@ -806,7 +1003,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        print(f"[proxy] {self.address_string()} - {fmt % args}")
+        _log(f"{self.address_string()} - {fmt % args}")
 
 
 def main():
@@ -820,7 +1017,10 @@ def main():
         sys.stdout = _Tee(sys.__stdout__, log_file)
         sys.stderr = _Tee(sys.__stderr__, log_file)
     except OSError as e:
-        print(f"[proxy] WARNING: could not open log file {args.log_file!r}: {e}",
+        # Tee setup failed, so write straight to the real stderr with a manual
+        # timestamp (same format _log uses) for consistency.
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [proxy] WARNING: "
+              f"could not open log file {args.log_file!r}: {e}",
               file=sys.__stderr__)
 
     # Record uncaught exceptions (per-request handler crashes included) with
@@ -854,14 +1054,18 @@ def main():
         if _shutdown_started["flag"]:
             return  # second Ctrl-C — let the default handler kill us hard
         _shutdown_started["flag"] = True
-        print(f"\n[proxy] signal {signum} received — aborting upstreams and shutting down")
+        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [proxy] signal "
+              f"{signum} received — aborting upstreams and shutting down")
         abort_all_upstreams(f"signal {signum}")
         # shutdown() must be called from a different thread than serve_forever.
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
-    print(f"Ollama VS Code BYOM proxy running on 0.0.0.0:{args.port}")
+    # Timestamp the banner so restarts are easy to find in the log; the
+    # indented sub-lines below are continuations of this line.
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Ollama VS Code BYOM proxy "
+          f"running on 0.0.0.0:{args.port}")
     print(f"  -> backend:      {RewriteProxyHandler.ollama_url}")
     print(f"  -> target model: {args.model}")
     print(f"  -> default reasoning_effort: "
