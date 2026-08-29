@@ -256,8 +256,14 @@ After container startup and having models downloaded, create a small launcher sc
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Ollama server environment (see ollama_proxy.md "Suggested Ollama environment").
+# NUM_PARALLEL=1 is what makes the proxy's queue-wait / patient-retry logic
+# meaningful: a single slot means every request either runs or queues.
 export OLLAMA_CONTEXT_LENGTH=82000
 export OLLAMA_KV_CACHE_TYPE=q8_0
+export OLLAMA_NUM_PARALLEL=1
+export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_MAX_QUEUE=512
 
 # 1) Start Ollama in the background
 nohup ollama serve > /tmp/ollama.log 2>&1 &
@@ -275,8 +281,12 @@ for i in $(seq 1 30); do
 done
 ollama run qwen3-coder ""
 
-# 3) Start the proxy in front of Ollama (internal port 8050, bound to host 8080)
-python3 -u ollama_proxy.py --model qwen3-coder --port 8050 --filter-windows-tools > /tmp/ollama_proxy.log 2>&1 &
+# 3) Start the proxy in front of Ollama (binds 0.0.0.0:8050; upstream is 127.0.0.1:11434).
+#    The shell redirect is the single log writer; --log-file /dev/null disables
+#    the internal tee so we don't double-write the same file (and no stray
+#    ollama_proxy.log appears in this directory).
+python3 -u ollama_proxy.py --model qwen3-coder --port 8050 \
+    --filter-windows-tools --log-file /dev/null > /tmp/ollama_proxy.log 2>&1 &
 PROXY_PID=$!
 
 echo "Ollama (pid $OLLAMA_PID) + proxy (pid $PROXY_PID) running. Ctrl-C to stop both."
@@ -410,6 +420,12 @@ This option works best overall. First I've tried this setup with Continue.dev ex
 The "id" values here are **not** real Ollama model names — they're directives decoded by the proxy. All three entries point at the same underlying wrapper (`qwen3-coder`), because the proxy rewrites every request's `model` field to it anyway. The suffix is what matters: `-nothink` maps to `reasoning_effort=none` (no hidden reasoning at all — fast, cheap, ideal for triaging logs and quick questions), while `-think-high` and `-think-medium` map to the matching effort levels for deeper analysis and patching work respectively. The proxy also supports `-think-low` and `-think-max` if you want more presets; any ID without a recognized suffix falls through to `--default-effort` (or Ollama's default behavior).
 
 Add endpoint URL (here "http://192.168.10.10:8080" — the host port bound to the proxy's internal 8050) and don't forget to set model context - here sum of "maxInputTokens" and "maxOutputTokens" should be slightly less than total window set in ollama (82000). "Slightly less" is literal here: note that the whole context window of 82K tokens is not fully allocated. There's a headroom of 2K tokens, and that's intentional. LLM prompt results might slightly vary in size and sometimes can grow a bit larger than allocated buffer limits which will truncate the output in best case, or will cause "request body too big" errors on Copilot side, wasting a perfectly fine formulated answer which you will have to re-calculate again from scratch. So leave as is, and in case you will have more headroom, add it to maxInputTokens for non-thinking variants and to maxOutputTokens for thinking ones. Note the per-preset budgets: no-thinking requests need little output room (8K) so they can afford a huge input window (74K); thinking presets reserve more for output because hidden reasoning consumes completion tokens — 32K for deep analysis, 18K for patching. All three sum to 80,000, keeping the same 2K headroom under Ollama's 82K window.
+
+**WARNING** 
+
+Important note on the VS Code Copilot automatic conversation compaction feature: as of Aug 29, 2026 this feature is BROKEN. It's overly aggressive, and when token context window fills up to roughly 60%, it starts agressively compacting conversation ON EVERY SINGLE STEP. Compaction is complex process which takes a lot of time (might be up 10-15 minutes sometimes) and useful context is often lost after it, so such an enforced compaction makes it almost impossible to work with LLM (because after every compaction, the context is getting changed and LLM has to reconsider it) and is wasting a ton of computational capacity. Also, Ollama manages context automatically itself and does it pretty well, so VS Code Copilot automatic conversation compaction in this case is both useless and harmful. So it makes total sense to disable it while you're at it. You will still retain the ability to compact coversation yourself via button in Copilot chat or using `/compact` chat command.
+
+To disable this thing, open VS Code command palette via `Ctrl+Shift+P` and search for `Chat: Chat Settings`, and in this settings, search for `summarizeAgentConversationHistory` then uncheck it. Also makes sense then to click on the gearbox icon on the left of this settings and select "Apply to all profiles".
 
 #### Option 2: Cursor extension
 

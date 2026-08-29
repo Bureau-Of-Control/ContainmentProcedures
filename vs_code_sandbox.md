@@ -111,3 +111,9 @@ USER root
 - Press F1 (or Ctrl+Shift+P) and select **Dev Containers: Reopen in Container**.
 - VS Code will build the image and restart inside the container. First start will be slow (might take up to 20 minutes) as it will instantiate the container from scratch, and for this, it will download some Docker image layers.
 - **Verify Isolation:** Open the terminal inside VS Code and try to access your host's sensitive directories (e.g., ls /mnt/c/Users/YourUser/.ssh). If configured correctly, the container should only have access to its own virtual filesystem and the specific workspace folder and nowhere else.
+
+**WARNING** 
+
+Important note on the VS Code Copilot automatic conversation compaction feature: as of Aug 29, 2026 this feature is BROKEN. It's overly aggressive, and when token context window fills up to roughly 60%, it starts agressively compacting conversation ON EVERY SINGLE STEP. Compaction is complex process which takes a lot of time (might be up 10-15 minutes sometimes) and useful context is often lost after it, so such an enforced compaction makes it almost impossible to work with LLM (because after every compaction, the context is getting changed and LLM has to reconsider it) and is wasting a ton of computational capacity. Also, Ollama manages context automatically itself and does it pretty well, so VS Code Copilot automatic conversation compaction in this case is both useless and harmful. So it makes total sense to disable it while you're at it. You will still retain the ability to compact coversation yourself via button in Copilot chat or using `/compact` chat command.
+
+To disable this thing, open VS Code command palette via `Ctrl+Shift+P` and search for `Chat: Chat Settings`, and in this settings, search for `summarizeAgentConversationHistory` then uncheck it. Also makes sense then to click on the gearbox icon on the left of this settings and select "Apply to all profiles".
