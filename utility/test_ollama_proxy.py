@@ -1319,6 +1319,231 @@ class LogTimestampTests(ProxyIntegrationBase):
 
 
 # ===================================================================
+# 16. INTEGRATION — BrokenPipeError suppression on client disconnect
+# ===================================================================
+
+class BrokenPipeSuppressionTests(ProxyIntegrationBase):
+    """When the client disconnects mid-stream, the proxy must NOT dump a
+    BrokenPipeError traceback into the log. The disconnect is already logged
+    with a clean message; the finish() override swallows the socketserver
+    flush/close error."""
+
+    def test_no_brokenpipe_traceback_on_disconnect(self):
+        """Client closes mid-stream → no 'BrokenPipeError' or 'Traceback' in log."""
+
+        def handler(h, method, path, body, n):
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.end_headers()
+            # Stream slowly so the client can disconnect mid-way
+            for i in range(10):
+                try:
+                    chunk = json.dumps({"choices": [{"delta": {"content": f"tok{i}"}}]})
+                    h.wfile.write(f"data: {chunk}\n\n".encode())
+                    h.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(0.4)
+
+        self.fake.on_request = handler
+        self._start_proxy()
+
+        body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        request = (
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.proxy_port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+        ).encode() + body
+
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=15)
+        try:
+            sock.sendall(request)
+            # Read one chunk, then abruptly close (simulates VS Code abort)
+            buf = b""
+            while b"data:" not in buf:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                buf += data
+        finally:
+            sock.close()
+
+        # Give the proxy time to detect disconnect, finish(), and log
+        time.sleep(2.0)
+        log = self.read_proxy_log()
+
+        # The clean disconnect message should be present
+        self.assertTrue(
+            "client disconnected mid-stream" in log
+            or "client gone" in log
+            or "aborting upstream" in log,
+            f"expected a clean disconnect log message:\n{log}"
+        )
+        # Critically: NO BrokenPipeError traceback should appear
+        self.assertNotIn("BrokenPipeError", log,
+                         f"BrokenPipeError traceback leaked into log:\n{log}")
+        self.assertNotIn("Traceback (most recent call last)", log,
+                         f"unhandled exception traceback in log:\n{log}")
+
+    def test_no_brokenpipe_on_forced_stream_disconnect(self):
+        """Same check for the forced-stream (non-streaming client) path."""
+
+        def handler(h, method, path, body, n):
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.end_headers()
+            # Slow SSE so the client can leave before reassembly completes
+            for i in range(10):
+                try:
+                    chunk = json.dumps({"choices": [{"delta": {"content": f"t{i}"}}]})
+                    h.wfile.write(f"data: {chunk}\n\n".encode())
+                    h.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(0.4)
+
+        self.fake.on_request = handler
+        self._start_proxy()
+
+        # Non-streaming request → proxy forces stream=true upstream
+        body = json.dumps({"model": "m", "stream": False, "messages": []}).encode()
+        request = (
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.proxy_port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+        ).encode() + body
+
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=15)
+        try:
+            sock.sendall(request)
+            time.sleep(1.0)  # let it start streaming upstream, then leave
+        finally:
+            sock.close()
+
+        time.sleep(2.0)
+        log = self.read_proxy_log()
+        self.assertNotIn("BrokenPipeError", log,
+                         f"BrokenPipeError traceback leaked into log:\n{log}")
+        self.assertNotIn("Traceback (most recent call last)", log,
+                         f"unhandled exception traceback in log:\n{log}")
+
+
+# ===================================================================
+# 17. INTEGRATION — TLS bytes detection on plain-HTTP port
+# ===================================================================
+
+class TlsDetectionTests(ProxyIntegrationBase):
+    """When a client sends TLS/HTTPS bytes to our plain-HTTP proxy, the proxy
+    must detect it, return a clean 426 response, and NOT log binary garbage."""
+
+    def test_tls_handshake_gets_426(self):
+        """Send a minimal TLS ClientHello → expect 426 Upgrade Required."""
+        self._start_proxy()
+
+        # Minimal TLS 1.2/1.3 ClientHello record:
+        #   0x16 = handshake, 0x03 0x01 = TLS 1.0 version (record layer)
+        #   followed by length and a few bytes of payload
+        tls_bytes = b"\x16\x03\x01\x00\x05\x01\x00\x00\x02\x01\x00"
+
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5)
+        try:
+            sock.sendall(tls_bytes)
+            # Read the response
+            chunks = []
+            sock.settimeout(5)
+            while True:
+                try:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+                except socket.timeout:
+                    break
+            raw = b"".join(chunks)
+        finally:
+            sock.close()
+
+        # Must get a 426 status
+        self.assertIn(b"426", raw.split(b"\r\n")[0],
+                      f"expected 426 in status line, got: {raw[:100]!r}")
+        # Response body should be human-readable (not binary garbage)
+        header_end = raw.find(b"\r\n\r\n")
+        if header_end != -1:
+            body = raw[header_end + 4:]
+            self.assertIn(b"plain HTTP", body,
+                          f"expected helpful message in body, got: {body!r}")
+
+        # Log must contain the clean TLS-detection message
+        log = self.read_proxy_log()
+        self.assertIn("received TLS bytes on plain-HTTP port", log,
+                      f"expected TLS detection log line:\n{log}")
+        # And critically: NO binary garbage in the log
+        self.assertNotIn(b"\x16\x03\x01".decode("latin-1"), log)
+
+    def test_tls_app_data_gets_426(self):
+        """TLS application-data record (0x17 first byte) also detected."""
+        self._start_proxy()
+
+        tls_bytes = b"\x17\x03\x03\x00\x05\x01\x02\x03\x04\x05"
+
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5)
+        try:
+            sock.sendall(tls_bytes)
+            chunks = []
+            sock.settimeout(5)
+            while True:
+                try:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+                except socket.timeout:
+                    break
+            raw = b"".join(chunks)
+        finally:
+            sock.close()
+
+        self.assertIn(b"426", raw.split(b"\r\n")[0],
+                      f"expected 426, got: {raw[:100]!r}")
+        log = self.read_proxy_log()
+        self.assertIn("received TLS bytes on plain-HTTP port", log)
+
+    def test_normal_http_still_works_after_tls_detection(self):
+        """After a TLS rejection, the proxy must still serve normal HTTP requests."""
+        self._start_proxy()
+
+        # First: send TLS garbage (should get 426)
+        tls_bytes = b"\x16\x03\x01\x00\x05\x01\x00\x00\x02\x01\x00"
+        sock = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5)
+        try:
+            sock.sendall(tls_bytes)
+            sock.recv(4096)  # drain response
+        finally:
+            sock.close()
+
+        # Second: normal HTTP request must still work
+        body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", body)
+        self.assertEqual(status, 200)
+
+    def test_non_tls_binary_not_misdetected(self):
+        """A normal HTTP request starting with 'P' (POST) must NOT be treated as TLS."""
+        self._start_proxy()
+
+        # 'P' = 0x50, not in (0x16, 0x17) — should pass through normally
+        body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        status, _, _ = http_post(f"{self.proxy_url}/v1/chat/completions", body)
+        self.assertEqual(status, 200)
+        # No TLS-detection log line should appear
+        log = self.read_proxy_log()
+        self.assertNotIn("received TLS bytes", log)
+
+
+# ===================================================================
 # Runner
 # ===================================================================
 

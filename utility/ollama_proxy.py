@@ -46,6 +46,36 @@ import urllib.request
 import urllib.error
 
 
+class _PrependReader:
+    """Read wrapper that re-delivers a previously-read byte before the rest.
+
+    Used by handle_one_request: we read 1 byte to detect TLS, and if it's
+    not TLS we need to hand it back to BaseHTTPRequestHandler which reads
+    the request line from self.rfile. This class prepends that byte.
+    """
+    def __init__(self, prepend: bytes, underlying):
+        self._buf = prepend
+        self._underlying = underlying
+
+    def read(self, size=-1):
+        if self._buf:
+            data = self._buf
+            self._buf = b""
+            return data[:size] if size >= 0 else data
+        return self._underlying.read(size)
+
+    def readline(self, length=None):
+        if self._buf:
+            first_byte = self._buf
+            self._buf = b""
+            rest = self._underlying.readline(length)
+            return first_byte + rest
+        return self._underlying.readline(length)
+
+    def __getattr__(self, name):
+        return getattr(self._underlying, name)
+
+
 class _Tee:
     """Write to several streams (console + log file), flushing each write so
     crashes are never lost in a buffer."""
@@ -1001,6 +1031,76 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
+
+    def finish(self):
+        """Override socketserver's finish() to suppress BrokenPipeError.
+
+        When the client disconnects mid-stream (aborted request, VS Code
+        timeout, etc.), we break out of the streaming loop and log a clean
+        message. But then socketserver calls wfile.close(), which tries to
+        flush remaining buffered bytes into a dead socket — raising
+        BrokenPipeError that propagates through process_request_thread and
+        dumps a full traceback via sys.excepthook. The disconnect is already
+        logged by our streaming loop; the traceback adds nothing but noise.
+        """
+        try:
+            super().finish()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client already gone — expected, already logged
+
+    def handle_one_request(self):
+        """Override to detect TLS bytes sent to this plain-HTTP proxy.
+
+        VS Code (or a retry mechanism) occasionally sends an HTTPS/TLS
+        ClientHello to our HTTP port. The first byte of a TLS record is
+        0x16 (handshake) or 0x17 (application data). Without detection,
+        BaseHTTPRequestHandler tries to parse it as an HTTP request line,
+        fails, and logs the raw binary garbage as a 400 — polluting the log
+        with unreadable bytes. We detect the TLS magic, send a clean 426
+        (Upgrade Required) response, and close the connection quietly.
+
+        Implementation: read the first byte; if it's not TLS, wrap rfile so
+        that byte is re-delivered before the rest of the stream, then call
+        super().handle_one_request() as normal.
+        """
+        try:
+            first = self.rfile.read(1)
+        except (ConnectionResetError, OSError):
+            return  # client already gone
+        if not first:
+            return  # clean EOF — nothing to do
+        if first[0] in (0x16, 0x17):
+            # TLS record — this is an HTTPS client hitting our HTTP port.
+            _log(f"{self.address_string()} - received TLS bytes on plain-HTTP "
+                 f"port; sending 426 Upgrade Required")
+            try:
+                # send_response() needs requestline + request_version, which are
+                # normally set by parsing the HTTP request line. Since we never
+                # parsed a valid request, initialize them manually.
+                self.requestline = b"<TLS>"
+                self.request_version = "HTTP/1.1"
+                self.send_response(426)
+                self.send_header("Content-Type", "text/plain")
+                body = b"This proxy speaks plain HTTP. Use http:// not https://"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client already gone
+            # Prevent the parent handle() loop from trying to read another
+            # request line on this connection.
+            self.close_connection = True
+            return
+        # Not TLS — re-deliver the byte and proceed normally.
+        self.rfile = _PrependReader(first, self.rfile)
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected while we were flushing the response. This is
+            # expected on mid-stream aborts; the disconnect is already logged
+            # by our streaming loop. Swallow it to avoid a traceback dump.
+            pass
 
     def log_message(self, fmt, *args):
         _log(f"{self.address_string()} - {fmt % args}")

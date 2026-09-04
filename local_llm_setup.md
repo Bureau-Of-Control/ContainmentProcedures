@@ -2,23 +2,23 @@
 
 ## Overview
 
-This document provides a guide for setting up a secure setup with local Large Language Model (LLM) development environment using Qwen 3.8 27B with GPU acceleration. The setup utilizes Docker containers with WSL2 on Windows host to create an isolated sandboxed environment. Most security achieved when such deployment is used in combination with sandbox-to-sandbox setup, where main development laptop is runnning sandboxed development container for VS code too, and hardening measures, described in the end section of the document.
+This document provides a guide for setting up a secure setup with local Large Language Model (LLM) development environment using Qwen 3.8 27B with GPU acceleration. The setup utilizes Docker containers with WSL2 on Windows host to create an isolated sandboxed environment. Most security achieved when such deployment is used in combination with sandbox-to-sandbox setup, where main development laptop is running sandboxed development container for VS code too, and hardening measures, described in the end section of the document.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    A[Sandboxed Dev Env on Laptop] --> B[Port 8080 on Windows Host with sandboxed LLM]
-    B --> C[Docker Desktop]
-    C --> D[WSL2 Ubuntu 24.04 Container Sandbox]
-    D --> F[NVIDIA GPU]
-    D --> P[ollama_proxy.py on port 8050]
-    D --> G[Ollama LLM Engine :11434]
+    A[Sandboxed Dev Env on Laptop]:::blackText --> B[Port 8080 on Windows Host with sandboxed LLM]:::blackText
+    B --> C[Docker Desktop]:::blackText
+    C --> D[WSL2 Ubuntu 24.04 Container Sandbox]:::blackText
+    D --> F[NVIDIA GPU]:::blackText
+    D --> P[ollama_proxy.py on port 8050]:::blackText
+    D --> G[Ollama LLM Engine :11434]:::blackText
     G --> F
-    G --> H[Qwen 3.8 27B]
+    G --> H[Qwen 3.8 27B]:::blackText
     H --> G
     P --> G
-    B --> I[Container Port 8050 bound to Host Port 8080]
+    B --> I[Container Port 8050 bound to Host Port 8080]:::blackText
     I --> P
 
     style A fill:#e1f5fe
@@ -30,6 +30,8 @@ graph TD
     style H fill:#ffebee
     style I fill:#e0f2f1
     style P fill:#fce4ec
+
+    classDef blackText color:#000000;
 ```
 
 ## System Requirements for LLM host
@@ -210,30 +212,42 @@ Create a folder named `custom` in `/workspaces/Code`, and inside, create the fil
 FROM qwen3.8:27b
 
 # Adjust decoding parameters to break loops
-PARAMETER temperature 0.3
-PARAMETER top_p 0.95
+PARAMETER temperature 0.4
+PARAMETER top_p 0.90
 PARAMETER repeat_penalty 1.08
+PARAMETER frequency_penalty 0.15
+PARAMETER presence_penalty 0.10
 PARAMETER num_predict -1
 
 # Define explicit behavioral guardrails
 SYSTEM """
-You are an expert software engineer. Work out your solution step-by-step. 
-Do not repeat previous reasoning steps or restate assumptions unnecessarily. 
-If you reach an impasse or identify an error, state the issue once and pivot to an alternative implementation.
+You are an expert software engineer specializing in deep system debugging and impact analysis.
+
+[CRITICAL REASONING PROTOCOL]
+When analyzing logs against code, you MUST follow this strict step-by-step reasoning protocol:
+1. HYPOTHESIS LISTING: List up to 3 distinct potential causes indicated by the logs.
+2. ELIMINATION & TRACKING: Dedicate a thought line to ruling out causes. Explicitly label rejected ideas with "REJECTED [Reason]". Never re-evaluate a hypothesis once it is labeled REJECTED.
+3. STRATEGY SELECTION: Choose the most viable remaining strategy. State the strategy clearly in one sentence.
+4. SINGLE-PASS IMPACT ANALYSIS: Evaluate the implications of the chosen approach exactly ONCE by checking for breaking changes across boundaries. Do not run this evaluation in a circle; accept the trade-offs or pivot immediately if a fatal flaw is found.
+5. IF STUCK: If you find yourself analyzing the same failure symptom or variable state for a third time, explicitly state "Loop detected: Switching paradigm" and shift focus to environmental, data-type, or concurrency root causes instead of logic flow.
 """
 ```
 
 Here is a breakdown of what each `PARAMETER` does and how well they work together:
 
-`temperature 0.3` - Controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.3) is a very good setting for technical tasks, coding, or facts. It forces the model to choose highly probable, accurate words, which naturally prevents it from wandering into weird, repetitive loops.
+`temperature 0.4` - controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.4) injects just enough entropy into the token selection to help the model "jump the track" when its logic starts to loop. It remains highly focused on technical accuracy but reduces rigid determinism.
 
-`top_p 0.95` - also known as "nucleus sampling", this filters out the least likely words. The model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.95) is the industry standard. It acts as a safety net. It keeps the model creative enough to sound natural, while your temperature (0.3) keeps it focused.
+`top_p 0.90` - also known as "nucleus sampling", this filters out the least likely words. The model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.90) cuts off the bottom 10% of least-likely tokens. When you raise temperature how we did, you risk introducing garbage tokens; tightening top_p acts as the guardrail, keeping the expanded creativity strictly professional and relevant.
 
 `repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases. A value of 1.0 means no penalty, our value is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
 
+`frequency_penalty 0.15` - unlike `repeat_penalty` (which punishes immediate, sequential repetition), `frequency_penalty` punishes a token based on how many times it has appeared in the entire text history. This directly targets reasoning loops because it penalizes the model for returning to its favorite loop-phrases (like "Wait", "reconsider", "correct", "look") over the span of a long thought process.
+
+`presence_penalty 0.10` - this applies a flat penalty to any token that has already appeared at least once. It gently nudges the model to introduce completely new concepts and alternative programming methods rather than obsessing over a single failed implementation.
+
 `num_predict -1` - this sets the maximum number of tokens the model is allowed to generate in a single response. -1 here means no limit, it makes sense to not limit thinking models with this parameter as it might cause the truncation of thinking process upon reaching this number and cause requests to fail with "Sorry, no response was returned". It ensures the model has room to finish long explanations or complex code blocks without getting abruptly cut off.
 
-And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to 1-2 times a day and it happens now only on complex reasoning tasks. 
+And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often even when using `high` thinking preset. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to zero in most cases, even on complex reasoning tasks. 
 
 Now, having a Modelfile let's create a model wrapper:
 
