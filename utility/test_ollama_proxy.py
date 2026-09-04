@@ -479,6 +479,37 @@ class FilterWindowsToolsTests(unittest.TestCase):
         # tool_choice references a non-Windows name → kept
         self.assertIn("tool_choice", payload)
 
+    def test_list_tool_choice_all_windows_dropped(self):
+        """List-form tool_choice whose entries are all Windows tools is dropped."""
+        payload = {
+            "tools": [
+                {"type": "function", "function": {"name": "powershell"}},
+                {"type": "function", "function": {"name": "cmd"}},
+            ],
+            "tool_choice": ["powershell", "cmd"],
+        }
+        removed = ollama_proxy.filter_windows_tools(payload)
+        self.assertEqual(removed, 2)
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_list_tool_choice_mixed_keeps_non_windows(self):
+        """List-form tool_choice (all tools removed) keeps non-Windows entries,
+        drops Windows ones — mirroring the dict-form semantics."""
+        payload = {
+            "tools": [
+                {"type": "function", "function": {"name": "powershell"}},
+                {"type": "function", "function": {"name": "cmd"}},
+            ],
+            # Mixed list: powershell/cmd are Windows (dropped), bash is kept.
+            "tool_choice": ["powershell", "bash"],
+        }
+        removed = ollama_proxy.filter_windows_tools(payload)
+        self.assertEqual(removed, 2)
+        self.assertNotIn("tools", payload)
+        # Only the non-Windows entry survives in tool_choice.
+        self.assertEqual(payload["tool_choice"], ["bash"])
+
     def test_no_tools_returns_zero(self):
         payload = {"messages": []}
         self.assertEqual(ollama_proxy.filter_windows_tools(payload), 0)
@@ -1541,6 +1572,99 @@ class TlsDetectionTests(ProxyIntegrationBase):
         # No TLS-detection log line should appear
         log = self.read_proxy_log()
         self.assertNotIn("received TLS bytes", log)
+
+
+# ===================================================================
+# 16. REVIEW FIXES — header forwarding & error-body fidelity
+# ===================================================================
+
+class HeaderForwardingTests(ProxyIntegrationBase):
+    """The proxy inspects/reassembles the upstream body as text, so it must force
+    identity encoding toward Ollama (never forward a client's Accept-Encoding),
+    while still forwarding other benign client headers."""
+
+    def _simple_ok_handler(self, h, method, path, body, n):
+        resp = b'{"ok":true}'
+        h.send_response(200)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(resp)))
+        h.end_headers()
+        h.wfile.write(resp)
+
+    def test_accept_encoding_forced_identity_upstream(self):
+        """A client's Accept-Encoding (e.g. gzip) must NOT reach Ollama — a
+        compressed response would be read as opaque bytes and silently break SSE
+        reassembly. The proxy forces identity encoding upstream instead."""
+        self.fake.on_request = self._simple_ok_handler
+        self._start_proxy()
+
+        body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        http_post(f"{self.proxy_url}/v1/chat/completions", body,
+                  headers={"Accept-Encoding": "gzip"})
+
+        fwd = {k.lower(): v for k, v in self.fake.last_request()["headers"].items()}
+        # The client asked for gzip; upstream must be told identity instead.
+        self.assertEqual(fwd.get("accept-encoding"), "identity")
+
+    def test_other_client_headers_still_forwarded(self):
+        """Guard: forcing identity encoding must not over-strip — a benign custom
+        header still reaches Ollama unchanged."""
+        self.fake.on_request = self._simple_ok_handler
+        self._start_proxy()
+
+        body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        http_post(f"{self.proxy_url}/v1/chat/completions", body,
+                  headers={"X-Custom-Header": "keepme"})
+
+        fwd = {k.lower(): v for k, v in self.fake.last_request()["headers"].items()}
+        self.assertEqual(fwd.get("x-custom-header"), "keepme")
+
+
+class ErrorForwardingFidelityTests(ProxyIntegrationBase):
+    """Regression guard for the LIVE error-forwarding path: a permanent 4xx from
+    Ollama is surfaced with its real status and FULL body (urllib raises
+    HTTPError; _forward_with_retry_inner forwards e.read()). Multi-line JSON must
+    stay valid — not truncated to one line."""
+
+    def _plain_error_handler(self, status: int, raw_body: bytes):
+        def handler(h, method, path, body, n):
+            h.send_response(status)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(raw_body)))
+            h.end_headers()
+            h.wfile.write(raw_body)
+        self.fake.on_request = handler
+
+    def test_single_line_error_surfaced_intact(self):
+        """A single-line 400 error body is forwarded with its real status and
+        valid JSON."""
+        raw = b'{"error":{"message":"model not found"}}\n'
+        self._plain_error_handler(400, raw)
+        self._start_proxy()
+
+        body = json.dumps({"model": "m", "stream": False, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", body)
+        self.assertEqual(status, 400)
+        result = json.loads(resp_body)
+        self.assertIn("model not found", result["error"]["message"])
+
+    def test_multiline_error_surfaced_intact(self):
+        """A multi-line 400 error body is forwarded in full (valid JSON), proving
+        the live path preserves the whole body rather than a single line."""
+        raw = (b'{\n'
+               b'  "error": {\n'
+               b'    "message": "context length exceeded",\n'
+               b'    "type": "invalid_request_error"\n'
+               b'  }\n'
+               b'}\n')
+        self._plain_error_handler(400, raw)
+        self._start_proxy()
+
+        body = json.dumps({"model": "m", "stream": False, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", body)
+        self.assertEqual(status, 400)
+        result = json.loads(resp_body)   # must be valid JSON (full body preserved)
+        self.assertIn("context length exceeded", result["error"]["message"])
 
 
 # ===================================================================

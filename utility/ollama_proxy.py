@@ -353,7 +353,8 @@ def filter_windows_tools(payload):
 
     payload["tools"] = kept
     # If nothing is left, drop the field entirely and any tool_choice that
-    # references a now-missing Windows tool.
+    # references a now-missing Windows tool. Handles both dict-form ({"type":
+    # "function", ...}) and list-form (["name1", "name2"]) tool_choice.
     if not kept:
         payload.pop("tools", None)
         val = payload.get("tool_choice")
@@ -362,6 +363,15 @@ def filter_windows_tools(payload):
             name = str(val.get("name", "") or (fn.get("name", "") if isinstance(fn, dict) else ""))
             if WINDOWS_TOOL_PATTERNS.search(name):
                 payload.pop("tool_choice", None)
+        elif isinstance(val, list):
+            # Drop entries that name a Windows tool; remove the field entirely
+            # if nothing remains (mirrors the dict-form behaviour above).
+            kept_choices = [e for e in val
+                            if not (isinstance(e, str) and WINDOWS_TOOL_PATTERNS.search(e))]
+            if len(kept_choices) == 0:
+                payload.pop("tool_choice", None)
+            else:
+                payload["tool_choice"] = kept_choices
     return removed
 
 
@@ -382,11 +392,22 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
     def _forward_headers(self):
         # Drop hop-by-hop headers, Host, and Content-Length (urllib recomputes
         # it from the actual body — forwarding the client's value would be
-        # wrong whenever we rewrite the payload).
-        skip = HOP_BY_HOP | {"host", "content-length"}
-        return {
-            k: v for k, v in self.headers.items() if k.lower() not in skip
-        }
+        # wrong whenever we rewrite the payload). Also drop the client's
+        # Accept-Encoding: this proxy reads/reassembles the upstream body as
+        # text, so a compressed response (gzip/deflate) would arrive as opaque
+        # bytes and silently break SSE reassembly. We then force identity
+        # encoding explicitly — urllib auto-adds "Accept-Encoding: identity"
+        # when the header is absent, but setting it here makes the intent
+        # explicit and deterministic regardless of client headers.
+        skip = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
+        fwd = {k: v for k, v in self.headers.items() if k.lower() not in skip}
+        fwd["Accept-Encoding"] = "identity"
+        return fwd
+
+    def _is_chat_completions(self) -> bool:
+        """True when the request targets POST /v1/chat/completions (trailing
+        slash tolerated). Centralised so the path check isn't duplicated."""
+        return self.path.rstrip("/").endswith("/v1/chat/completions")
 
     def _send_error_body(self, code, message):
         body = json.dumps({"error": {"message": message}}).encode("utf-8")
@@ -831,6 +852,14 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 if "model" in payload:
                     payload["model"] = self.target_model
 
+                # Per-request correlation line — grep by rid in ollama.log to
+                # trace a single request end-to-end (requested -> target, stream
+                # flag, tool count). Cheap and always emitted for JSON chat calls.
+                _log(f"{rid} {self.path} requested={requested!r} "
+                     f"-> target={self.target_model!r} "
+                     f"stream={bool(payload.get('stream'))} "
+                     f"tools={len(payload.get('tools') or [])}")
+
                 # KEY FIX (long-thinking stall): when the client asks for a
                 # NON-streaming chat completion, Ollama generates the ENTIRE
                 # reply — including all internal thinking tokens — before
@@ -846,14 +875,13 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # timeout (background worker) and only polls client liveness.
                 # We reassemble the SSE chunks into the single JSON body the
                 # client expects.
-                if (self.path.rstrip("/").endswith("/v1/chat/completions")
-                        and not payload.get("stream")):
+                if self._is_chat_completions() and not payload.get("stream"):
                     payload["stream"] = True
                     forced_stream = True
 
                 # Strip Windows-native tools for chat completions only.
                 if (self.filter_windows_tools_enabled
-                        and self.path.rstrip("/").endswith("/v1/chat/completions")):
+                        and self._is_chat_completions()):
                     removed = filter_windows_tools(payload)
                     if removed:
                         _log(f"filtered {removed} Windows tool(s)")

@@ -76,6 +76,11 @@ are removed from the payload. If that empties the tool list, `tools` and any
 `tool_choice` referencing a Windows tool are dropped too. Word boundaries mean
 harmless words like `command` or `cmdline` are **not** matched.
 
+Both `tool_choice` shapes are handled when all tools are removed: dict-form
+(`{"type":"function","function":{"name":...}}`) is dropped if it names a Windows
+tool, and list-form (`["powershell", "bash"]`) keeps only the non-Windows entries
+(dropping the field entirely if none remain).
+
 ## How long thinking is made safe
 
 This is the core of the proxy. Three cooperating mechanisms:
@@ -191,7 +196,7 @@ Two safety properties:
 | `GET /_health` | Proxy liveness probe — does **not** touch Ollama, so it works even when the upstream is wedged. Returns JSON: `{"status":"ok","active_upstreams":N,"fail_streak":M,"recovery_threshold":K}`. Handy for monitoring or auto-restart scripts. |
 | `POST /_abort` | Closes **all** in-flight upstream connections → Ollama aborts its generation(s) and frees the slot immediately. Returns how many were closed. |
 | Graceful shutdown | On SIGTERM/SIGINT, actively closes every in-flight upstream (frees the slot) then shuts down the server. Second Ctrl-C kills hard. |
-| Per-request log | Each request gets an 8-hex `rid`; logs show header/queue-wait time and total time, e.g. `[2026-08-28 14:03:11] [proxy] 31cc7ffe headers in 65.7s (status=200)` … `[2026-08-28 14:05:19] [proxy] 31cc7ffe done in 98.2s`. Every log line is prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp for easy correlation across interleaved requests. |
+| Per-request log | Each request gets an 8-hex `rid`; logs show the request identity (path, requested→target model, stream flag, tool count), header/queue-wait time, and total time. Example: `[2026-09-04 10:15:02] [proxy] a3f1c9e2 /v1/chat/completions requested='qwen3-coder-think-high' -> target='qwen3-coder' stream=True tools=3` … `[2026-09-04 10:15:02] [proxy] a3f1c9e2 headers in 0.3s (status=200)` … `[2026-09-04 10:17:11] [proxy] a3f1c9e2 done in 128.5s`. Every log line is prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp for easy correlation across interleaved requests. |
 | Crash tracebacks | `sys.excepthook` + a tee'd stdout/stderr write full tracebacks to the log file, flushed immediately so they survive a crash. |
 | GET passthrough | `GET` requests (e.g. `/v1/models`, `/api/tags`) pass through unchanged. |
 
@@ -222,6 +227,11 @@ export OLLAMA_MAX_QUEUE=512
 
 ## Notes & limitations
 
+- **Upstream encoding is forced to identity.** The proxy reads and reassembles the
+  upstream body as text (SSE reassembly), so a compressed response would arrive as
+  opaque bytes and silently break parsing. It therefore drops any client
+  `Accept-Encoding` header and sends `Accept-Encoding: identity` toward Ollama,
+  guaranteeing an uncompressed body regardless of what the client asked for.
 - **Chunked request bodies are not supported** — the proxy returns `411` rather
   than forward an empty body. VS Code / Node always send `Content-Length` for
   JSON POSTs, so this is defensive only.
