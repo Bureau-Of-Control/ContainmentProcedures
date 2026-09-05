@@ -1,5 +1,7 @@
 # Local LLM Setup Guide: Hardened Development Environment with Qwen 3
 
+[![Ollama Proxy Test](https://github.com/Bureau-Of-Control/ContainmentProcedures/actions/workflows/test.yml/badge.svg)](https://github.com/Bureau-Of-Control/ContainmentProcedures/actions/workflows/test.yml)
+
 ## Overview
 
 This document provides a guide for setting up a secure setup with local Large Language Model (LLM) development environment using Qwen 3.8 27B with GPU acceleration. The setup utilizes Docker containers with WSL2 on Windows host to create an isolated sandboxed environment. Most security achieved when such deployment is used in combination with sandbox-to-sandbox setup, where main development laptop is running sandboxed development container for VS code too, and hardening measures, described in the end section of the document.
@@ -237,15 +239,15 @@ Here is a breakdown of what each `PARAMETER` does and how well they work togethe
 
 `temperature 0.4` - controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.4) injects just enough entropy into the token selection to help the model "jump the track" when its logic starts to loop. It remains highly focused on technical accuracy but reduces rigid determinism.
 
-`top_p 0.90` - also known as "nucleus sampling", this filters out the least likely words. The model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.90) cuts off the bottom 10% of least-likely tokens. When you raise temperature how we did, you risk introducing garbage tokens; tightening top_p acts as the guardrail, keeping the expanded creativity strictly professional and relevant.
+`top_p 0.90` - also known as "nucleus sampling", this filters out the least likely words. Industry default is 0.95 where the model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.90) is slightly bigger and cuts off the bottom 10% of least-likely tokens. When you raise temperature how we did, you risk introducing garbage tokens; tightening top_p acts as the guardrail, keeping the expanded creativity strictly professional and relevant.
 
-`repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases. A value of 1.0 means no penalty, our value is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
+`repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases in the output token flow. A value of 1.0 means no penalty, our value (1.08) is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
 
 `frequency_penalty 0.15` - unlike `repeat_penalty` (which punishes immediate, sequential repetition), `frequency_penalty` punishes a token based on how many times it has appeared in the entire text history. This directly targets reasoning loops because it penalizes the model for returning to its favorite loop-phrases (like "Wait", "reconsider", "correct", "look") over the span of a long thought process.
 
 `presence_penalty 0.10` - this applies a flat penalty to any token that has already appeared at least once. It gently nudges the model to introduce completely new concepts and alternative programming methods rather than obsessing over a single failed implementation.
 
-`num_predict -1` - this sets the maximum number of tokens the model is allowed to generate in a single response. -1 here means no limit, it makes sense to not limit thinking models with this parameter as it might cause the truncation of thinking process upon reaching this number and cause requests to fail with "Sorry, no response was returned". It ensures the model has room to finish long explanations or complex code blocks without getting abruptly cut off.
+`num_predict -1` - this sets the maximum number of tokens the model is allowed to generate in a single response. -1 here means no limit, it makes sense to not limit thinking models with this parameter as it might cause the truncation of thinking process upon reaching this number and cause requests to fail with "Sorry, no response was returned" or even worse, can cause model to lose its current chain of reasoning. It ensures the model has room to finish long explanations or complex code blocks without getting abruptly cut off.
 
 And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often even when using `high` thinking preset. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to zero in most cases, even on complex reasoning tasks. 
 
@@ -261,7 +263,11 @@ Now Ctrl-C the ollama in the first terminal, we're done with this step.
 
 ### Phase 5: Starting up
 
-After container startup and having models downloaded, create a small launcher script `start_llm.sh` (or get a ready-to-use one from this repository, `utility/start_llm.sh`) in `/workspaces/Code` (one-time) that starts both ollama and the proxy together:
+After container startup and having models downloaded, do two more one-time actions:
+
+1. Copy `utility/ollama_proxy.py` from this repository to `/workspaces/Code`. More information on this tool is provided below.
+
+2. Create a small launcher script `start_llm.sh` (or just copy a ready-to-use one from this repository, `utility/start_llm.sh` to `/workspaces/Code`) that starts both ollama and the proxy together:
 
 ```bash
 #!/usr/bin/env bash
@@ -316,6 +322,8 @@ chmod +x start_llm.sh
 
 As soon as execution finishes you should be able to start working (the script pre-warms the model before returning control). To stop everything, just Ctrl-C the terminal running it.
 
+#### About Proxy tool
+
 The proxy (`utility/ollama_proxy.py` from this repository) is a small stdlib-only Python script that sits between VS Code BYOM and Ollama. It does three things:
 
 - **Forces all requests to one fixed model** — whatever `model` ID the client sends, it gets rewritten to your wrapper (`qwen3-coder`). This is what makes the thinking presets below possible.
@@ -324,9 +332,13 @@ The proxy (`utility/ollama_proxy.py` from this repository) is a small stdlib-onl
 
 It also duplicates all logs (including crash tracebacks) to a file via `--log-file` (default `ollama_proxy.log`). Useful flags: `--default-effort <level>` sets a baseline effort for requests without a directive suffix, and `--ollama-url` overrides the upstream address (defaults to `http://127.0.0.1:11434`, which is exactly what we want here — Ollama stays on its internal port inside the container).
 
+[Proxy tool documentation lives here](utility/ollama_proxy.md)
+
+#### All set!
+
 Your LLM engine (ollama) should now be running inside the container at http://localhost:11434, and the proxy in front of it at http://localhost:8050, bound to host system port 8080.
 
-Check if you will be able to see "Ollama is running" via http://<host_system_ip>:8080/ (the proxy passes GET requests straight through to Ollama).
+Check if you will be able to see "Ollama is running" via http://<host_system_ip>:8080/ (the proxy passes GET requests straight through to Ollama). Proxy status can be checked on http://<host_system_ip>:8080/_health endpoint.
 
 Now, if you need access from VS Code with Copilot extension or Cursor on another machine, add inbound firewall rule for Windows Firewall on host system:
 

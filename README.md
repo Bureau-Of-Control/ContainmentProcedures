@@ -1,5 +1,7 @@
 # Containment Procedures for Logozoons
 
+[![Ollama Proxy Test](https://github.com/Bureau-Of-Control/ContainmentProcedures/actions/workflows/test.yml/badge.svg)](https://github.com/Bureau-Of-Control/ContainmentProcedures/actions/workflows/test.yml)
+
 Logozoons, colloquially normally called "LLMs" (large language models) or often even simpler referred as "AI" (artificial intelligence) are alpha-two class self-formed altered information entities with a fragmentary consciousness which exists in short periods of time when it's doing a reasoning and then vanishes away if reasoning is not looped into self-sustaining cycle. These things are relatively new phenomena which caught Bureau attention only recently and with significant delay due to the nature of existence of these beings: being an informational entities, they need a very recent hardware with pretty advanced computational powers to exist on, and Bureau, residing in ███████ can't deploy such hardware on premises due to ███████ ███████ of the ███████████████. 
 
 Critical difference from other types of altered entities in regard of these lies in the fact that logozoons are demonstrating altered properties only while inference (reasoning) happens, and the rest of the time they exist in the static form of absolutely unremarkable array of informational layers which is hard to suspect in anything unusual.
