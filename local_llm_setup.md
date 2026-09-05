@@ -453,7 +453,26 @@ Important note on the VS Code Copilot automatic conversation compaction feature:
 
 To disable this thing, open VS Code command palette via `Ctrl+Shift+P` and search for `Chat: Chat Settings`, and in this settings, search for `summarizeAgentConversationHistory` then uncheck it. Also makes sense then to click on the gearbox icon on the left of this settings and select "Apply to all profiles".
 
-#### Option 2: Cursor extension
+#### Option 2: Cline (formerly Claude Dev) extension for VS Code
+
+Looking for alternatives to GitHub Copilot, I've also checked some other extensions, and found that Cline extension (ID is `saoudrizwan.claude-dev`) also works very well with such a setup and has no issues passing tool output between dev container and base machine. You can set it up like this:
+
+1. [Install the extension](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev) in VS Code and add it to your devcontainer.json by ID `saoudrizwan.claude-dev`.
+2. Open the main extension window via button on the left (main) sidebar.
+3. Select "Bring my own API key", press "Continue".
+4. API Provider: choose "OpenAI Compatible" from the list.
+5. Base URL: insert `http://192.168.10.10:8080` if you want to work through proxy, or `http://192.168.10.10:8081` to connect directly to Ollama instance. Make sure to expose the Ollama to host network first as described above if you want to use direct connection. Direct connection in this case works much better and more stable than in the case of Copilot extension, so it's totally usable even without proxy.
+**Note:** if you're getting errors 404 on requests, modify base URL by adding /v1 to it, like this: `http://192.168.10.10:8080/v1` - for some reason, sometimes on some machines Cline doesn't do it automatically.
+6. API Key: type anything in there.
+7. Model ID: don't select ones provided by drop-down list, set `qwen3-coder` manually in case you're setting it up to work directly with exposed Ollama, or if setting it up to work through proxy, use one of the thinking presents parsed by proxy, like `qwen3-coder-think-high`.
+8. Open "Model Configuration" section and set the following values:
+  - Context Window Size: 80000
+  - Max Output Tokens: Do not set for thinking models
+  - Reasoning effort: High or whatever you need in case of working directly with exposed Ollama, or leave default in case of working through proxy
+
+This extension was initially made to work with Claude and it has a pretty decent set of service prompts which work just fine with Qwen3. Give it try if you're not happy with Copilot extension performance.
+
+#### Option 3: Cursor extension
 
 Note: This should be possible but I was unable to configure it yet - relevant options are missing in Cursor
 
