@@ -399,11 +399,11 @@ It can slow down the whole execution significantly so makes sense to adjust the 
 
 This option works best overall. First I've tried this setup with Continue.dev extension, but it's very limited in such setup as extension can't read output of remote terminal calls at the moment - it's not yet implemented. With Microsoft Copilot there's no such limitation, it works perfectly fine with such a setup.
 
-0. Make sure you have logged in to GitHub Copilot. You don't need a paid subcsription so even a free account will work.
-1. Open VS Code and make sure you have the GitHub Copilot extension installed (should be installed already as it's defined in devcontainer.json).
-2. In Copilot sidebar model selection click "Manage models".
-3. Click blue "Add Models" button and Choose "Custom Endpoint". Enter any group name and any random API key. For API type choose "Chat Completions API".
-4. This will open a JSON config with empty template, fill in the config section like this:
+1. Open VS Code, and make sure you have the GitHub Copilot extension installed (should be installed already as it's defined in devcontainer.json). Note that you DON'T need a paid subcsription or even a free account at all. Extension is fully capable to use your custom BYOM model for tasks planner and chat responses. Signing in is not necessary and even not advised, as if you will sign in, then by default VS Code will use Microsoft's own GitHub Copilot chat model for normal prompts and planning tasks and will only offload difficult tasks to your custom model. Bad thing about it is that GitHub Copilot model is often overloaded/rate-limited and slow to respond, which is wasting your time.
+2. When extension will ask you to select BYOK model, click it, and it will open up setting "Byok Utility Model Default" (you can always find this setting later by ID: `chat.byokUtilityModelDefault`), select in there "Main Agent Model" instead of GitHub Copilot.
+3. In Copilot sidebar model selection click "Manage models".
+4. Click blue "Add Models" button and Choose "Custom Endpoint". Enter any group name and any random API key. For API type choose "Chat Completions API".
+5. This will open a JSON config with empty template, fill in the config section like this:
 
 ```json
 {
@@ -455,7 +455,7 @@ To disable this thing, open VS Code command palette via `Ctrl+Shift+P` and searc
 
 #### Option 2: Cline (formerly Claude Dev) extension for VS Code
 
-Looking for alternatives to GitHub Copilot, I've also checked some other extensions, and found that Cline extension (ID is `saoudrizwan.claude-dev`) also works very well with such a setup and has no issues passing tool output between dev container and base machine. You can set it up like this:
+Looking for alternatives to GitHub Copilot, I've also checked some other extensions, and found that Cline extension (ID is `saoudrizwan.claude-dev`) also works pretty well with such a setup and has no issues passing tool output between dev container and base machine. You can set it up like this:
 
 1. [Install the extension](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev) in VS Code and add it to your devcontainer.json by ID `saoudrizwan.claude-dev`.
 2. Open the main extension window via button on the left (main) sidebar.
@@ -470,7 +470,7 @@ Looking for alternatives to GitHub Copilot, I've also checked some other extensi
   - Max Output Tokens: Do not set for thinking models
   - Reasoning effort: High or whatever you need in case of working directly with exposed Ollama, or leave default in case of working through proxy
 
-This extension was initially made to work with Claude and it has a pretty decent set of service prompts which work just fine with Qwen3. Give it try if you're not happy with Copilot extension performance.
+This extension was initially made to work with Claude and it has a pretty complex set of service prompts which not every model is capable of using properly. Like for example with Qwen3 results might vary - I've seen it looping on reasoning with Cline much more often that with Copilot extension. Give it a try if you're not happy with Copilot extension performance.
 
 #### Option 3: Cursor extension
 
