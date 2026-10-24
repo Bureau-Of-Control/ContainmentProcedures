@@ -214,16 +214,18 @@ Create a folder named `custom` in `/workspaces/Code`, and inside, create the fil
 FROM qwen3.8:27b
 
 # Adjust decoding parameters to break loops
-PARAMETER temperature 0.4
+PARAMETER temperature 0.5
 PARAMETER top_p 0.90
-PARAMETER repeat_penalty 1.08
-PARAMETER frequency_penalty 0.15
-PARAMETER presence_penalty 0.10
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.15
+PARAMETER repeat_last_n 128
+PARAMETER frequency_penalty 0.20
+PARAMETER presence_penalty 0.0
 PARAMETER num_predict -1
 
 # Define explicit behavioral guardrails
 SYSTEM """
-You are an expert software engineer specializing in deep system debugging and impact analysis.
+You are an expert software engineer specializing in deep system debugging and impact analysis. When analyzing a coding problem or a test failure, state your conclusion once. Do not re-evaluate the same assumptions or repeat your logical deductions. Move directly and quickly from your initial analysis to the final, comprehensive code implementation.
 
 [CRITICAL REASONING PROTOCOL]
 When analyzing logs against code, you MUST follow this strict step-by-step reasoning protocol:
@@ -241,15 +243,23 @@ Here is a breakdown of what each `PARAMETER` does and how well they work togethe
 
 `top_p 0.90` - also known as "nucleus sampling", this filters out the least likely words. Industry default is 0.95 where the model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.90) is slightly bigger and cuts off the bottom 10% of least-likely tokens. When you raise temperature how we did, you risk introducing garbage tokens; tightening top_p acts as the guardrail, keeping the expanded creativity strictly professional and relevant.
 
-`repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases in the output token flow. A value of 1.0 means no penalty, our value (1.08) is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
+`top_k 20` - parameter that limits the next-token selection to a fixed number (k) of the most probable words or tokens. This value is typically very tight for general models, Qwen's thinking logic is fine-tuned strictly around a top_k of 20 to focus its initial token space.
 
-`frequency_penalty 0.15` - unlike `repeat_penalty` (which punishes immediate, sequential repetition), `frequency_penalty` punishes a token based on how many times it has appeared in the entire text history. This directly targets reasoning loops because it penalizes the model for returning to its favorite loop-phrases (like "Wait", "reconsider", "correct", "look") over the span of a long thought process.
+`repeat_penalty 1.15` - this directly penalizes the model for repeating the exact same words or phrases in the output token flow. A value of 1.0 means no penalty, our value (1.15) is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
 
-`presence_penalty 0.10` - this applies a flat penalty to any token that has already appeared at least once. It gently nudges the model to introduce completely new concepts and alternative programming methods rather than obsessing over a single failed implementation.
+`repeat_last_n 128` - controls how far back the model looks to prevent repetition, in number of tokens. Works great when model falls into n-gram repetition loop inside its internal thinking state, repeating same big phrase over and over again.
+
+`frequency_penalty 0.20` - unlike `repeat_penalty` (which punishes immediate, sequential repetition), `frequency_penalty` punishes a token based on how many times it has appeared in the entire text history. This directly targets reasoning loops because it penalizes the model for returning to its favorite loop-phrases (like "Wait", "reconsider", "correct", "look") over the span of a long thought process.
+
+`presence_penalty 0.0` - disables any penalties or rewards based on whether a word/token has already appeared in the text. The model chooses words purely based on its standard training probabilities.
 
 `num_predict -1` - this sets the maximum number of tokens the model is allowed to generate in a single response. -1 here means no limit, it makes sense to not limit thinking models with this parameter as it might cause the truncation of thinking process upon reaching this number and cause requests to fail with "Sorry, no response was returned" or even worse, can cause model to lose its current chain of reasoning. It ensures the model has room to finish long explanations or complex code blocks without getting abruptly cut off.
 
 And `SYSTEM` prompt works just like a cherry on top of that. With wrapper like above, Qwen still can sometimes fall into the reasoning loop but it happen much less often even when using `high` thinking preset. Without this wrapper it typically happened for me 10-12 times a day while doing literally anything, while with the wrapper number of such occasions dropped to zero in most cases, even on complex reasoning tasks. 
+
+**WARNING**
+
+Parameters above are optimized exactly for THINKING mode for coding use. It works very well, but might be suboptimal for non-thinking mode, for this one parameters have to differ and significantly. Also, note on reasoning level: for Qwen so far by my experience, it seems like `medium` thinking preset works best, because on `high` or `xhigh` Qwen tends to overthink things heavily, it literally tries to think through whole architecture end-to-end before writing a single line of the code. This doesn't works well with small context windows, as this huge chain of thought overflows it, plus its very slow - this thinking process without making a single code edit can drag for tens of minutes.
 
 Now, having a Modelfile let's create a model wrapper:
 

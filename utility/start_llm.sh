@@ -34,7 +34,7 @@ ollama run qwen3-coder ""
 #    the internal tee so we don't double-write the same file (and no stray
 #    ollama_proxy.log appears in this directory).
 python3 -u ollama_proxy.py --model qwen3-coder --port 8050 \
-    --filter-windows-tools --log-file /dev/null > /tmp/ollama_proxy.log 2>&1 &
+    --filter-windows-tools --log-file /tmp/ollama_proxy.log 2>&1 &
 PROXY_PID=$!
 
 echo "Ollama (pid $OLLAMA_PID) + proxy (pid $PROXY_PID) running. Ctrl-C to stop both."

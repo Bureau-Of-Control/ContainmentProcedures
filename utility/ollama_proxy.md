@@ -193,12 +193,25 @@ Two safety properties:
 
 | Feature | Detail |
 |---------|--------|
-| `GET /_health` | Proxy liveness probe — does **not** touch Ollama, so it works even when the upstream is wedged. Returns JSON: `{"status":"ok","active_upstreams":N,"fail_streak":M,"recovery_threshold":K}`. Handy for monitoring or auto-restart scripts. |
+| `GET /_health` | Proxy liveness probe — does **not** touch Ollama, so it works even when the upstream is wedged. Returns JSON: `{"status":"ok","active_upstreams":N,"fail_streak":M,"recovery_threshold":K,"uptime_s":U}` (process uptime in whole seconds). Handy for monitoring or auto-restart scripts. The same dict is embedded verbatim into `/_status/data`, built by one shared function (`_health_payload`) so the two endpoints can never drift apart. |
 | `POST /_abort` | Closes **all** in-flight upstream connections → Ollama aborts its generation(s) and frees the slot immediately. Returns how many were closed. |
 | Graceful shutdown | On SIGTERM/SIGINT, actively closes every in-flight upstream (frees the slot) then shuts down the server. Second Ctrl-C kills hard. |
 | Per-request log | Each request gets an 8-hex `rid`; logs show the request identity (path, requested→target model, stream flag, tool count), header/queue-wait time, and total time. Example: `[2026-09-04 10:15:02] [proxy] a3f1c9e2 /v1/chat/completions requested='qwen3-coder-think-high' -> target='qwen3-coder' stream=True tools=3` … `[2026-09-04 10:15:02] [proxy] a3f1c9e2 headers in 0.3s (status=200)` … `[2026-09-04 10:17:11] [proxy] a3f1c9e2 done in 128.5s`. Every log line is prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp for easy correlation across interleaved requests. |
 | Crash tracebacks | `sys.excepthook` + a tee'd stdout/stderr write full tracebacks to the log file, flushed immediately so they survive a crash. |
 | GET passthrough | `GET` requests (e.g. `/v1/models`, `/api/tags`) pass through unchanged. |
+
+## Web UI (`/_log`, `/_status`)
+
+Two self-contained HTML pages (inline CSS/JS, no external assets) served by the proxy itself — black console theme with colored output lines:
+
+- **`http://localhost:<port>/_log`** — live log viewer in a full-window scroll area. Polls `GET /_log/tail?lines=2000` every 2 s; timestamps are dimmed, error/exception/fatal lines red, warnings amber. Auto-sticks to the bottom while new lines arrive; status dot turns amber if polling fails. The tail is read from the *end* of the log file (`--log-file`, default `ollama_proxy.log`) so it stays fast regardless of file size and tolerates a missing/truncated file (returns an empty list).
+- **`http://localhost:<port>/_status`** — dashboard with four tables:
+  - **Runtime state** (linked to `/_health`) — live proxy health: status, active upstream connections, consecutive-failure streak (red when >0), recovery threshold, process uptime. Served from the same shared builder as `GET /_health`, so both endpoints always agree.
+  - **Proxy configuration** — the CLI parameters the proxy was started with: raw `argv` plus the parsed values in effect (`model`, `port`, `ollama_url`, `default_effort`, `filter_windows_tools`, `log_file`).
+  - **GPU** — per-GPU name, temperature, power draw, memory usage from `nvidia-smi --query-gpu=...` (memory shown as a bar; red above 85 %). If `nvidia-smi` is missing/fails, an error line is shown instead.
+  - **Loaded models** — full output of `ollama ps` (NAME, ID, SIZE, PROCESSOR, CONTEXT, RUNNER, UNTIL), with wrapped continuation lines folded back into the last column.
+
+Both pages auto-refresh (`/_status` every 5 s) and cross-link to each other. Data endpoints are plain JSON: `GET /_log/tail?lines=N`, `GET /_status/data`. Everything is stdlib only — GPU/model data comes from shelling out via `subprocess`; a missing CLI degrades gracefully to an `"available": false` + error message in the JSON rather than crashing the page.
 
 ## Environment variables (tunables)
 

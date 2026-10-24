@@ -268,15 +268,21 @@ class ProxyProcess:
             "--model", "test-model",
             "--port", str(port),
             "--ollama-url", ollama_url,
-            "--log-file", "/dev/null",
+            # Use the real temp log file (not /dev/null) so /_log/tail has
+            # content to serve and read_log() captures the proxy's own output.
+            "--log-file", self.log_path,
         ]
         if extra_args:
             cmd.extend(extra_args)
 
-        with open(self.log_path, "w") as log_file:
-            self.proc = subprocess.Popen(
-                cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT,
-            )
+        # Truncate/create the log file up front; the child tees its stdout+stderr
+        # into it itself. Parent streams go to DEVNULL — redirecting them into
+        # the same file would write every line twice.
+        with open(self.log_path, "w"):
+            pass
+        self.proc = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+        )
 
     def wait_ready(self, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
@@ -1144,6 +1150,8 @@ class AutoRecoveryTests(ProxyIntegrationBase):
         self.assertIn("active_upstreams", result)
         self.assertIn("fail_streak", result)
         self.assertIn("recovery_threshold", result)
+        self.assertIsInstance(result["uptime_s"], int)  # process uptime (seconds since start)
+        self.assertGreaterEqual(result["uptime_s"], 0)
         self.assertIsInstance(result["active_upstreams"], int)
         self.assertIsInstance(result["fail_streak"], int)
 
@@ -1665,6 +1673,118 @@ class ErrorForwardingFidelityTests(ProxyIntegrationBase):
         self.assertEqual(status, 400)
         result = json.loads(resp_body)   # must be valid JSON (full body preserved)
         self.assertIn("context length exceeded", result["error"]["message"])
+
+
+# ===================================================================
+# 19. INTEGRATION — web UI endpoints (/_log, /_status)
+# ===================================================================
+
+class WebUIEndpointTests(ProxyIntegrationBase):
+    """Verify the /_log and /_status HTML pages and their JSON data endpoints."""
+
+    def test_log_page_returns_html(self):
+        self._start_proxy()
+        status, headers, body = http_get(f"{self.proxy_url}/_log")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        text = body.decode("utf-8")
+        self.assertIn("<!DOCTYPE html>", text)
+        self.assertIn("_log/tail", text)  # JS polls this endpoint
+
+    def test_log_tail_returns_json_lines(self):
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_log/tail?lines=50")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        self.assertIsInstance(result["lines"], list)
+        # The proxy writes a startup banner to the log file; at minimum we
+        # should see something (the banner or a request line).
+        self.assertGreater(len(result["lines"]), 0)
+
+    def test_log_tail_respects_lines_param(self):
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_log/tail?lines=1")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertLessEqual(len(result["lines"]), 1)
+
+    def test_status_page_returns_html(self):
+        self._start_proxy()
+        status, headers, body = http_get(f"{self.proxy_url}/_status")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        text = body.decode("utf-8")
+        self.assertIn("<!DOCTYPE html>", text)
+        self.assertIn("_status/data", text)  # JS polls this endpoint
+
+    def test_status_data_has_cli_section(self):
+        """The /_status/data JSON must include the CLI parameters."""
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_status/data")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+
+        cli = result["cli"]
+        # model is forced to "test-model" by ProxyProcess
+        self.assertEqual(cli["model"], "test-model")
+        # port matches the proxy's listen port
+        self.assertEqual(cli["port"], self.proxy_port)
+        # ollama_url points at our fake server
+        self.assertEqual(cli["ollama_url"], self.fake.url)
+        # default_effort not passed → None
+        self.assertIsNone(cli["default_effort"])
+        # filter_windows_tools not passed → False
+        self.assertFalse(cli["filter_windows_tools"])
+        # log_file is the harness temp file (absolute, as stored by main())
+        self.assertEqual(cli["log_file"], os.path.abspath(self._proxy.log_path))
+        # argv should be a list containing the script path and --model
+        self.assertIsInstance(cli["argv"], list)
+        self.assertIn("--model", cli["argv"])
+
+    def test_status_data_has_gpu_and_ollama_keys(self):
+        """Even if nvidia-smi / ollama are unavailable, the keys must exist."""
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_status/data")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertIn("gpu", result)
+        self.assertIn("ollama", result)
+        # Each must have an "available" boolean
+        self.assertIn("available", result["gpu"])
+        self.assertIn("available", result["ollama"])
+
+    def test_status_data_includes_health_fields(self):
+        """/_status/data must carry the same runtime state as /_health (shared builder)."""
+        self._start_proxy()
+        status_h, _, body_h = http_get(f"{self.proxy_url}/_health")
+        health = json.loads(body_h)
+        status_s, _, body_s = http_get(f"{self.proxy_url}/_status/data")
+        data = json.loads(body_s)
+
+        for key in ("status", "active_upstreams", "fail_streak", "recovery_threshold"):
+            self.assertIn(key, data, f"missing {key} in /_status/data")
+            # Values must match the dedicated endpoint (no drift between them).
+            self.assertEqual(data[key], health[key])
+
+    def test_status_data_with_default_effort(self):
+        """When --default-effort is passed, it appears in the CLI section."""
+        self.extra_args = ["--default-effort", "high"]
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_status/data")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["cli"]["default_effort"], "high")
+
+    def test_status_data_with_filter_windows_tools(self):
+        """When --filter-windows-tools is passed, it appears as True."""
+        self.extra_args = ["--filter-windows-tools"]
+        self._start_proxy()
+        status, _, body = http_get(f"{self.proxy_url}/_status/data")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["cli"]["filter_windows_tools"])
 
 
 # ===================================================================

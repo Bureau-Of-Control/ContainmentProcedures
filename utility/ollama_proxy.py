@@ -17,6 +17,11 @@ honours — top-level "think" is silently ignored there):
 Optional: filters Windows-native tools out of POST /v1/chat/completions
 payloads so they never enter the model context (Linux-only environments).
 
+Web UI (stdlib only, black console theme):
+    http://localhost:<port>/_log     live log viewer (polls every 2s)
+    http://localhost:<port>/_status  GPU (nvidia-smi) + loaded models
+                                     (ollama ps), auto-refreshes every 5s
+
 Usage:
     python3 ollama_proxy.py --model qwen3-coder \
         [--ollama-url http://127.0.0.1:11434] \
@@ -36,6 +41,7 @@ import queue
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -219,6 +225,9 @@ _UPSTREAM_FAIL_STREAK = 0
 _UPSTREAM_FAIL_LOCK = threading.Lock()
 RECOVERY_FAIL_THRESHOLD = int(os.environ.get("PROXY_RECOVERY_FAILS", "3"))
 
+# Process start time (epoch seconds) — reported as uptime_s in /_health & /_status/data.
+START_TIME = time.time()
+
 
 def _log(msg: str) -> None:
     """Emit one timestamped [proxy] log line.
@@ -268,6 +277,22 @@ def abort_all_upstreams(reason):
     if conns:
         _log(f"aborted {len(conns)} upstream connection(s): {reason}")
     return len(conns)
+
+
+def _health_payload():
+    """Build the /_health JSON dict. Shared by GET /_health and /_status/data so
+    both always report identical runtime state (active upstreams, fail streak)."""
+    with _ACTIVE_LOCK:
+        active = len(_ACTIVE_CONNECTIONS)
+    with _UPSTREAM_FAIL_LOCK:
+        streak = _UPSTREAM_FAIL_STREAK
+    return {
+        "status": "ok",
+        "uptime_s": int(time.time() - START_TIME),
+        "active_upstreams": active,
+        "fail_streak": streak,
+        "recovery_threshold": RECOVERY_FAIL_THRESHOLD,
+    }
 
 
 def think_directive(model_id):
@@ -375,12 +400,331 @@ def filter_windows_tools(payload):
     return removed
 
 
+# --- Web UI endpoints: /_log and /_status ----------------------------------
+# Both are stdlib-only. The pages are self-contained HTML (inline CSS/JS, no
+# external assets); the browser polls small JSON endpoints that this process
+# serves. Log tailing reads from the END of the log file (seek + backward
+# scan) so it stays O(lines) regardless of file size; GPU/model data comes
+# from nvidia-smi and `ollama ps` via subprocess.
+
+LOG_TAIL_MAX_LINES = 2000   # cap on lines returned per /_log/tail poll
+
+
+def _tail_log_lines(path, max_lines):
+    """Return the last up-to-max_lines lines of a text file (no full read).
+
+    Scans backward from EOF collecting newline offsets. Tolerates a missing
+    or truncated file (returns []). The final line may lack a trailing
+    newline (log still being written) — that's fine, we return it as-is.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return []
+            # Read in chunks from the end until we have enough newlines.
+            chunk = 64 * 1024
+            pos = size
+            count = 0
+            while pos > 0 and count <= max_lines:
+                step = min(chunk, pos)
+                f.seek(pos - step)
+                data = f.read(step)
+                # Count newlines in this chunk (scan from the end).
+                for i in range(len(data) - 1, -1, -1):
+                    if data[i] == 0x0A:
+                        count += 1
+                        if count > max_lines:
+                            break
+                pos -= step
+            # We now know where line (max_lines+1)-th-from-end starts; read
+            # from there to EOF and split.
+            f.seek(pos)
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = tail.splitlines()
+    return lines[-max_lines:]
+
+
+def _run_cmd(cmd, timeout=10):
+    """Run a command, return (returncode, stdout_text). Never raises."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, f"error: {e}"
+
+
+def _gpu_status():
+    """Query nvidia-smi for per-GPU name/temp/power/memory. Stdlib only."""
+    rc, out = _run_cmd([
+        "nvidia-smi",
+        "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    if rc != 0:
+        return {"available": False, "error": out.strip() or "nvidia-smi failed"}
+    gpus = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            continue
+        def _num(s):
+            try:
+                v = float(s)
+                return int(v) if v == int(v) else v
+            except ValueError:
+                return s
+        gpus.append({
+            "name": parts[0],
+            "temp_c": _num(parts[1]),
+            "power_w": _num(parts[2]),
+            "mem_used_mib": _num(parts[3]),
+            "mem_total_mib": _num(parts[4]),
+        })
+    return {"available": True, "gpus": gpus}
+
+
+def _ollama_ps():
+    """Parse `ollama ps` into a list of loaded-model rows. Stdlib only."""
+    rc, out = _run_cmd(["ollama", "ps"])
+    if rc != 0:
+        return {"available": False, "error": out.strip() or "ollama ps failed"}
+    lines = [l for l in out.splitlines() if l.strip()]
+    if not lines:
+        return {"available": True, "models": []}
+    # Header line is the first; data rows are separated by 2+ spaces (values
+    # like "17 GB" contain single spaces and must stay intact). `ollama ps`
+    # columns: NAME ID SIZE PROCESSOR CONTEXT RUNNER UNTIL. A row with fewer
+    # fields than the header is a wrapped continuation of the previous row's
+    # last column (narrow terminal) — append it there.
+    def _split_row(line):
+        return [p.strip() for p in re.split(r"\s{2,}", line.strip()) if p.strip()]
+
+    header = _split_row(lines[0])
+    models = []
+    for row in lines[1:]:
+        parts = _split_row(row)
+        if not parts:
+            continue
+        if len(parts) < len(header):
+            # Continuation of the previous row's last column.
+            if models:
+                key = header[-1]
+                models[-1][key] += " " + " ".join(parts)
+            continue
+        if len(parts) > len(header):
+            # Keep everything from the second-to-last column onward together
+            # (the final column, e.g. UNTIL, may contain spaces).
+            head = parts[:len(header) - 1]
+            tail = " ".join(parts[len(header) - 1:])
+            parts = head + [tail]
+        models.append(dict(zip(header, parts)))
+    return {"available": True, "models": models}
+
+
+# --- HTML pages (self-contained, black console theme) -----------------------
+
+_LOG_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Ollama Proxy — Log</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; background:#0a0e14; }
+  body { display:flex; flex-direction:column; font-family:"Cascadia Code","JetBrains Mono",Consolas,"DejaVu Sans Mono",monospace; }
+  header { display:flex; align-items:center; gap:12px; padding:8px 14px; background:#0d1320; border-bottom:1px solid #1e2a3a; color:#9fb3c8; font-size:13px; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#3fb950; box-shadow:0 0 6px #3fb950; }
+  header .dot.stale { background:#d29922; box-shadow:0 0 6px #d29922; }
+  header a { color:#58a6ff; text-decoration:none; margin-left:auto; font-size:13px; }
+  header a:hover { text-decoration:underline; }
+  #wrap { flex:1 1 auto; overflow-y:auto; padding:10px 14px; line-height:1.5; font-size:13px; white-space:pre-wrap; word-break:break-word; }
+  .ln { color:#c9d1d9; }
+  .ts { color:#6e7f8f; }
+  .err, .warn { color:#ff7b72; }
+  .warn { color:#ffa657; }
+  .ok { color:#3fb950; }
+  .info { color:#58a6ff; }
+</style></head>
+<body>
+<header>
+  <span class="dot" id="dot"></span><span>Ollama Proxy — live log (polls every 2s)</span>
+  <a href="/_status">/_status</a>
+</header>
+<div id="wrap"></div>
+<script>
+const wrap = document.getElementById('wrap');
+const dot = document.getElementById('dot');
+let lastCount = -1;
+async function poll() {
+  try {
+    const r = await fetch('/_log/tail?lines=2000');
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || 'bad response');
+    dot.classList.remove('stale');
+    const stick = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 40;
+    let html = '';
+    for (const line of j.lines) {
+      // Colour by content: timestamp dim, errors red, warnings amber.
+      let cls = 'ln';
+      if (/\\b(error|exception|traceback|failed|fatal)\\b/i.test(line)) cls = 'err';
+      else if (/\\b(warning|warn)\\b/i.test(line)) cls = 'warn';
+      const esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      // Dim the leading [YYYY-MM-DD HH:MM:SS] timestamp.
+      html += '<span class="' + cls + '">' + esc.replace(/^\\[[^\\]]*\\]/, m => '</span><span class="ts">' + m + '<span class="' + cls + '">') + '</span>\\n';
+    }
+    wrap.innerHTML = html;
+    if (stick || j.lines.length !== lastCount) wrap.scrollTop = wrap.scrollHeight;
+    lastCount = j.lines.length;
+  } catch (e) {
+    dot.classList.add('stale');
+  }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body></html>
+"""
+
+_STATUS_PAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Ollama Proxy — Status</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; min-height:100%; background:#0a0e14; }
+  body { font-family:"Cascadia Code","JetBrains Mono",Consolas,"DejaVu Sans Mono",monospace; color:#c9d1d9; padding:16px; }
+  header { display:flex; align-items:center; gap:12px; margin-bottom:18px; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#3fb950; box-shadow:0 0 6px #3fb950; }
+  header .dot.stale { background:#d29922; box-shadow:0 0 6px #d29922; }
+  header a { color:#58a6ff; text-decoration:none; margin-left:auto; font-size:13px; }
+  h2 { color:#58a6ff; font-size:14px; margin:22px 0 8px; border-bottom:1px solid #1e2a3a; padding-bottom:5px; text-transform:uppercase; letter-spacing:.08em; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid #141d2b; white-space:nowrap; }
+  th { color:#8b98a9; font-weight:normal; text-transform:uppercase; font-size:11px; letter-spacing:.05em; }
+  td.num, th.num { text-align:right; }
+  .ok { color:#3fb950; } .bad { color:#ff7b72; } .dim { color:#6e7f8f; }
+  .bar { display:inline-block; width:120px; height:8px; background:#141d2b; border-radius:4px; overflow:hidden; vertical-align:middle; margin-right:8px; }
+  .bar > i { display:block; height:100%; background:#3fb950; }
+  .bar > i.hot { background:#ff7b72; }
+  #stamp { color:#6e7f8f; font-size:12px; margin-left:auto; }
+</style></head>
+<body>
+<header>
+  <span class="dot" id="dot"></span><span>Ollama Proxy — status (auto-refresh 5s)</span>
+  <span id="stamp"></span>
+  <a href="/_log">/_log</a>
+</header>
+
+<h2>Runtime state (<a href="/_health">/_health</a>)</h2>
+<div id="runtime"><span class="dim">loading…</span></div>
+
+<h2>Proxy configuration (CLI parameters)</h2>
+<div id="cli"><span class="dim">loading…</span></div>
+
+<h2>GPU (nvidia-smi)</h2>
+<div id="gpu"><span class="dim">loading…</span></div>
+
+<h2>Loaded models (ollama ps)</h2>
+<div id="models"><span class="dim">loading…</span></div>
+
+<script>
+const dot = document.getElementById('dot');
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function bar(pct){ const p = Math.max(0, Math.min(100, pct)); const hot = p > 85 ? 'hot' : ''; return '<span class="bar"><i class="'+hot+'" style="width:'+p+'%"></i></span>' + p.toFixed(0) + '%'; }
+async function load() {
+  try {
+    const r = await fetch('/_status/data');
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || 'bad response');
+    dot.classList.remove('stale');
+    document.getElementById('stamp').textContent = 'updated ' + new Date().toLocaleTimeString();
+
+    // Runtime state — same data as GET /_health (uptime, active upstreams, fail streak)
+    let rt = '<span class="dim">unavailable</span>';
+    if (j.status !== undefined) {
+      const up = j.uptime_s == null ? '' : Math.floor(j.uptime_s / 3600) + 'h ' + Math.floor((j.uptime_s % 3600) / 60) + 'm';
+      const rows = [
+        ['status', j.status],
+        ['active_upstreams', String(j.active_upstreams)],
+        // Red when the proxy is currently in a failed-upstream streak — worth attention.
+        ['fail_streak', String(j.fail_streak), Number(j.fail_streak) > 0 ? 'bad' : ''],
+        ['recovery_threshold', String(j.recovery_threshold)],
+        ['uptime', up],
+      ].map(([k, v, cls]) => '<tr><td class="dim">' + esc(k) + '</td><td class="' + (cls||'') + '">' + esc(v) + '</td></tr>').join('');
+      rt = '<table>' + rows + '</table>';
+    }
+    document.getElementById('runtime').innerHTML = rt;
+
+    // CLI parameters the proxy was started with
+    let c = '<span class="dim">unavailable</span>';
+    if (j.cli) {
+      const rows = [
+        ['argv', j.cli.argv ? j.cli.argv.join(' ') : ''],
+        ['model', j.cli.model],
+        ['port', j.cli.port],
+        ['ollama_url', j.cli.ollama_url],
+        ['default_effort', j.cli.default_effort == null ? '(none)' : j.cli.default_effort],
+        ['filter_windows_tools', String(j.cli.filter_windows_tools)],
+        ['log_file', j.cli.log_file],
+      ].map(([k, v]) => '<tr><td class="dim">' + esc(k) + '</td><td>' + esc(v) + '</td></tr>').join('');
+      c = '<table><tr><th>Parameter</th><th>Value</th></tr>' + rows + '</table>';
+    }
+    document.getElementById('cli').innerHTML = c;
+
+    // GPU table
+    let g = '<span class="dim">nvidia-smi unavailable</span>';
+    if (j.gpu && j.gpu.available) {
+      const rows = j.gpu.gpus.map(x => {
+        const memPct = x.mem_total_mib ? (x.mem_used_mib / x.mem_total_mib * 100) : 0;
+        return '<tr><td>' + esc(x.name) + '</td>'
+          + '<td class="num">' + esc(x.temp_c) + ' °C</td>'
+          + '<td class="num">' + esc(x.power_w) + ' W</td>'
+          + '<td>' + bar(memPct) + ' <span class="dim">(' + esc(x.mem_used_mib) + '/' + esc(x.mem_total_mib) + ' MiB)</span></td></tr>';
+      }).join('');
+      g = '<table><tr><th>GPU</th><th class="num">Temp</th><th class="num">Power</th><th>Memory</th></tr>' + rows + '</table>';
+    } else if (j.gpu && j.gpu.error) {
+      g = '<span class="bad">' + esc(j.gpu.error) + '</span>';
+    }
+    document.getElementById('gpu').innerHTML = g;
+
+    // Models table
+    let m = '<span class="dim">no models loaded</span>';
+    if (j.ollama && j.ollama.available) {
+      if (j.ollama.models.length) {
+        const cols = Object.keys(j.ollama.models[0]);
+        const head = cols.map(c => c === 'NAME' ? '<th>' + esc(c) + '</th>' : '<th class="num">' + esc(c) + '</th>').join('');
+        const rows = j.ollama.models.map(row => {
+          return '<tr>' + cols.map(c => {
+            const v = row[c] == null ? '' : row[c];
+            return (c === 'NAME') ? '<td class="ok">' + esc(v) + '</td>' : '<td class="num">' + esc(v) + '</td>';
+          }).join('') + '</tr>';
+        }).join('');
+        m = '<table><tr>' + head + '</tr>' + rows + '</table>';
+      }
+    } else if (j.ollama && j.ollama.error) {
+      m = '<span class="bad">' + esc(j.ollama.error) + '</span>';
+    }
+    document.getElementById('models').innerHTML = m;
+  } catch (e) {
+    dot.classList.add('stale');
+  }
+}
+load();
+setInterval(load, 5000);
+</script>
+</body></html>
+"""
+
+
 class RewriteProxyHandler(BaseHTTPRequestHandler):
     # Config injected from the CLI (set on the class before serving).
     target_model = "qwen3-coder"
     ollama_url = "http://127.0.0.1:11434"
     filter_windows_tools_enabled = False
     default_effort = None
+    log_file_path = "ollama_proxy.log"  # absolute path, set in main()
+    listen_port = 0  # port the proxy was started with; set in main()
 
     # Generous I/O buffers for the client-facing socket (default wbufsize is
     # 0 = unbuffered, one syscall per line). A larger write buffer batches
@@ -419,6 +763,29 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Client already gone — nothing to deliver.
+            pass
+
+    def _send_html(self, html: str):
+        """Serve a self-contained HTML page (web UI endpoints)."""
+        body = html.encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _send_json(self, obj):
+        body = json.dumps(obj).encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
     def _client_alive(self):
@@ -1020,20 +1387,51 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                  f"(queue_wait={t_headers - t_received:.1f}s)")
 
     def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+
+        # --- Web UI: live log viewer. ---
+        if path == "/_log":
+            self._send_html(_LOG_PAGE_HTML)
+            return
+        if path == "/_log/tail":
+            try:
+                n = int(self.path.split("lines=", 1)[1].split("&", 1)[0])
+            except (IndexError, ValueError):
+                n = LOG_TAIL_MAX_LINES
+            n = max(1, min(n, LOG_TAIL_MAX_LINES))
+            self._send_json({"ok": True, "lines": _tail_log_lines(self.log_file_path, n)})
+            return
+
+        # --- Web UI: GPU + loaded-model status. ---
+        if path == "/_status":
+            self._send_html(_STATUS_PAGE_HTML)
+            return
+        if path == "/_status/data":
+            self._send_json({
+                "ok": True,
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                # Runtime state — identical to GET /_health (shared builder) so the two endpoints never disagree.
+                **_health_payload(),
+                # CLI parameters the proxy was started with: raw argv plus parsed values in effect.
+                "cli": {
+                    "argv": sys.argv,
+                    "model": self.target_model,
+                    "port": self.listen_port,
+                    "ollama_url": self.ollama_url,
+                    "default_effort": self.default_effort,
+                    "filter_windows_tools": bool(self.filter_windows_tools_enabled),
+                    "log_file": self.log_file_path,
+                },
+                "gpu": _gpu_status(),
+                "ollama": _ollama_ps(),
+            })
+            return
+
         # Proxy liveness endpoint — does NOT touch Ollama, so it works even
         # when the upstream is wedged. Handy for monitoring / auto-restart:
         #   curl http://localhost:8050/_health
         if self.path == "/_health":
-            with _ACTIVE_LOCK:
-                active = len(_ACTIVE_CONNECTIONS)
-            with _UPSTREAM_FAIL_LOCK:
-                streak = _UPSTREAM_FAIL_STREAK
-            payload = json.dumps({
-                "status": "ok",
-                "active_upstreams": active,
-                "fail_streak": streak,
-                "recovery_threshold": RECOVERY_FAIL_THRESHOLD,
-            }).encode("utf-8")
+            payload = json.dumps(_health_payload()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -1166,6 +1564,10 @@ def main():
     RewriteProxyHandler.ollama_url = args.ollama_url.rstrip("/")
     RewriteProxyHandler.filter_windows_tools_enabled = args.filter_windows_tools
     RewriteProxyHandler.default_effort = args.default_effort
+    # Absolute path so /_log tailing works regardless of the CWD the proxy
+    # was started from.
+    RewriteProxyHandler.log_file_path = os.path.abspath(args.log_file)
+    RewriteProxyHandler.listen_port = args.port
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), RewriteProxyHandler)
     # Let handler threads die with the process instead of blocking shutdown
@@ -1201,6 +1603,8 @@ def main():
     print(f"  -> filter Windows tools: {args.filter_windows_tools}")
     if args.log_file != "/dev/null":
         print(f"  -> log file:       {args.log_file} (stdout+stderr duplicated)")
+    print(f"  -> web UI:         http://localhost:{args.port}/_log   "
+          f"http://localhost:{args.port}/_status")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
