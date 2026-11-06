@@ -239,15 +239,15 @@ When analyzing logs against code, you MUST follow this strict step-by-step reaso
 
 Here is a breakdown of what each `PARAMETER` does and how well they work together:
 
-`temperature 0.4` - controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.4) injects just enough entropy into the token selection to help the model "jump the track" when its logic starts to loop. It remains highly focused on technical accuracy but reduces rigid determinism.
+`temperature 0.5` - controls the randomness of the model's output. A higher number (e.g., 0.8) makes the output more creative but chaotic, while a lower number makes it more predictable and focused. Our value (0.5) injects just enough entropy into the token selection to help the model "jump the track" when its logic starts to loop. It remains highly focused on technical accuracy but reduces rigid determinism.
 
 `top_p 0.90` - also known as "nucleus sampling", this filters out the least likely words. Industry default is 0.95 where the model only considers the top 95% most likely words and ignores the bottom 5% of weird or irrelevant choices. Our value (0.90) is slightly bigger and cuts off the bottom 10% of least-likely tokens. When you raise temperature how we did, you risk introducing garbage tokens; tightening top_p acts as the guardrail, keeping the expanded creativity strictly professional and relevant.
 
 `top_k 20` - parameter that limits the next-token selection to a fixed number (k) of the most probable words or tokens. This value is typically very tight for general models, Qwen's thinking logic is fine-tuned strictly around a top_k of 20 to focus its initial token space.
 
-`repeat_penalty 1.15` - this directly penalizes the model for repeating the exact same words or phrases in the output token flow. A value of 1.0 means no penalty, our value (1.15) is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
+`repeat_penalty 1.08` - this directly penalizes the model for repeating the exact same words or phrases in the output token flow. A value of 1.0 means no penalty, our value (1.08) is a perfect gentle nudge. It is high enough to stop the model from getting stuck in an infinite text loops, but low enough that it won't break the formatting of things like code, lists, or standard grammar where repeating words (like "the" or "and") is necessary. If you will need to tune this up, never raise it above 1.12-1.15 or model will be unable to write code, as it will be perceiving syntax elements as a penalized repetitions.
 
-`repeat_last_n 128` - controls how far back the model looks to prevent repetition, in number of tokens. Works great when model falls into n-gram repetition loop inside its internal thinking state, repeating same big phrase over and over again.
+`repeat_last_n 256` - controls how far back the model looks to prevent repetition, in number of tokens. Works great when model falls into n-gram repetition loop inside its internal thinking state, repeating same big phrase over and over again.
 
 `frequency_penalty 0.20` - unlike `repeat_penalty` (which punishes immediate, sequential repetition), `frequency_penalty` punishes a token based on how many times it has appeared in the entire text history. This directly targets reasoning loops because it penalizes the model for returning to its favorite loop-phrases (like "Wait", "reconsider", "correct", "look") over the span of a long thought process.
 
@@ -288,7 +288,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-export OLLAMA_CONTEXT_LENGTH=78000
+export OLLAMA_CONTEXT_LENGTH=82000
 export OLLAMA_KV_CACHE_TYPE=q8_0
 export OLLAMA_NUM_PARALLEL=1
 export OLLAMA_KEEP_ALIVE=24h

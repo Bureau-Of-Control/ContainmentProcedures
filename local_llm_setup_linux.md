@@ -389,7 +389,7 @@ ollama pull nomic-embed-text
 ollama pull qwen3.8:27b
 ```
 
-**Model identifier verification:** Check that `qwen3.8:27b` is a valid, available Ollama model tag before running the download. Do not silently substitute a different model. If the original tag is unavailable, identify the exact intended Qwen model and compatible quantization first.
+**Base model:** `qwen3.8:27b` is the base model used throughout this guide — it is also the `FROM` target in `custom/Modelfile`. Pull exactly this tag so your local `qwen3-coder` wrapper resolves to the same weights you tuned against.
 
 After downloading:
 
@@ -502,7 +502,7 @@ It also duplicates all logs (including crash tracebacks) to a file via `--log-fi
 
 For Linux-only clients, Windows tool filtering is not strictly necessary, but retaining the original proxy option preserves compatibility with existing client configurations and costs nothing.
 
-Full proxy documentation lives in [`ollama_proxy.md`](ollama_proxy.md) in this repository.
+Full proxy documentation lives in [`ollama_proxy.md`](utility/ollama_proxy.md) in this repository.
 
 ## Phase 8: Create the launcher
 
@@ -633,6 +633,8 @@ Expected behavior:
 - GPU memory usage should increase.
 - The model should ideally show 100% GPU processing.
 
+**Why this guide defaults to a smaller context window than the Windows setup.** The original Windows/WSL2 guide targets ~82K tokens (`OLLAMA_CONTEXT_LENGTH=82000`). On native Linux with this hardware I could not run 82K without part of the KV cache spilling into system RAM — `ollama ps` showed the model no longer fully resident on the GPU. So this guide's launcher deliberately starts at **78K** (`OLLAMA_CONTEXT_LENGTH=78000`) to keep the whole model plus its KV cache inside VRAM. If you have more headroom (or a different/larger GPU) you can raise it; if you still see CPU offload, lower it further as shown below.
+
 If Ollama reports partial CPU/GPU allocation, reduce the context window and restart the service.
 
 For example:
@@ -641,7 +643,7 @@ For example:
 export OLLAMA_CONTEXT_LENGTH=64000
 ```
 
-Then restart the launcher. Ollama context allocation is dependent on available VRAM, model quantization, and KV cache size. Do not assume that a model fitting in VRAM at 8K will also fit at 82K.
+Then restart the launcher. Ollama context allocation is dependent on available VRAM, model quantization, and KV cache size. Do not assume that a model fitting comfortably in VRAM at one window size will also fit at a significantly larger one — always verify with `ollama ps` after changing `OLLAMA_CONTEXT_LENGTH`.
 
 ## Phase 10: Configure VS Code clients
 
