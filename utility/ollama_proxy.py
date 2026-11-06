@@ -28,13 +28,23 @@ Usage:
         [--port 8085] \
         [--default-effort none|low|medium|high|max] \
         [--filter-windows-tools] \
+        [--password <secret>] \
+        [--auth-user proxy] \
         [--log-file ollama_proxy.log]
+
+Optional shared-secret authentication (--password): when set, every proxied
+request must present the secret as its API key ("Authorization: Bearer <pw>" or
+"x-api-key: <pw>") — VS Code BYOK puts it in the model group's "apiKey" field —
+and the web UI endpoints (/_log, /_status) require HTTP Basic auth (username =
+--auth-user, default "proxy"; password = --password). Omit --password to run with no protection.
 
 All log output (per-request lines, config banner, crash tracebacks) is
 duplicated to --log-file in addition to the console.
 """
 
 import argparse
+import base64
+import hmac
 import json
 import os
 import queue
@@ -128,6 +138,11 @@ THINK_DIRECTIVE = re.compile(
 )
 
 VALID_EFFORTS = ("none", "low", "medium", "high", "max")
+
+# Default username shown in the web UI's HTTP Basic-auth prompt when --password
+# is set. The password itself always comes from --password; this is only the
+# account name the browser asks for alongside it. Override with --auth-user.
+DEFAULT_AUTH_USER = "proxy"
 
 # Socket timeout (seconds) for the upstream Ollama connection during CONNECT
 # and HEADER phases. Once headers arrive, _iter_upstream_lines switches the
@@ -457,6 +472,19 @@ def parse_args():
         help="Duplicate all log output (stdout+stderr) to this file, "
              "including crash tracebacks (default: ollama_proxy.log; "
              "pass /dev/null to disable)",
+    )
+    parser.add_argument(
+        "--password",
+        default="",
+        help="Shared secret that clients must present as their API key "
+             "(VS Code BYOK 'apiKey') and as the HTTP Basic-auth password for "
+             "the web UI. Empty (default) disables all authentication.",
+    )
+    parser.add_argument(
+        "--auth-user",
+        default=DEFAULT_AUTH_USER,
+        help=f"Username for the web UI's HTTP Basic auth prompt when --password "
+             f"is set (default: {DEFAULT_AUTH_USER})",
     )
     return parser.parse_args()
 
@@ -836,6 +864,14 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
     default_effort = None
     log_file_path = "ollama_proxy.log"  # absolute path, set in main()
     listen_port = 0  # port the proxy was started with; set in main()
+    # Optional shared secret + Basic-auth username (set from --password / --auth-user).
+    # An empty password disables authentication entirely.
+    password = ""
+    auth_user = DEFAULT_AUTH_USER
+
+    # Web UI paths that use HTTP Basic auth (browser pop-up) rather than the
+    # shared-secret API key used by proxied upstream calls.
+    _WEB_UI_PATHS = {"/_log", "/_log/tail", "/_status", "/_status/data"}
 
     # Generous I/O buffers for the client-facing socket (default wbufsize is
     # 0 = unbuffered, one syscall per line). A larger write buffer batches
@@ -863,6 +899,118 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         """True when the request targets POST /v1/chat/completions (trailing
         slash tolerated). Centralised so the path check isn't duplicated."""
         return self.path.rstrip("/").endswith("/v1/chat/completions")
+
+    # --- Optional shared-secret authentication -----------------------------
+    # Enabled only when --password was passed at startup. Two mechanisms:
+    #   * Proxied upstream calls (VS Code BYOK): the password is presented as
+    #     the API key — either `Authorization: Bearer <pw>` or `x-api-key: <pw>`.
+    #   * Web UI endpoints (/_log, /_status...): standard HTTP Basic auth with a
+    #     browser pop-up; username = --auth-user (default "proxy"), password = --password.
+
+    @classmethod
+    def _auth_enabled(cls) -> bool:
+        return bool(cls.password)
+
+    @staticmethod
+    def _extract_api_key(headers) -> str | None:
+        """Pull the client's API key out of common header shapes.
+
+        VS Code BYOK sends its configured apiKey as an Authorization bearer
+        token; some clients use x-api-key instead. Returns the raw value or
+        None if neither header is present/parseable."""
+        auth = headers.get("Authorization", "")
+        if isinstance(auth, str) and auth.strip():
+            parts = auth.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() in ("bearer", "basic"):
+                return parts[1].strip()
+            if len(parts) == 1 and parts[0].lower() not in ("bearer", "basic"):
+                return parts[0].strip()  # bare-token form, be permissive
+        xkey = headers.get("x-api-key") or headers.get("X-Api-Key")
+        if isinstance(xkey, str) and xkey.strip():
+            return xkey.strip()
+        return None
+
+    def _check_api_key(self):
+        """Return True when authentication is disabled OR the request carries a
+        matching API key. On mismatch, send a 401 with WWW-Authenticate hinting
+        at both accepted schemes and return False (caller must stop)."""
+        if not self._auth_enabled():
+            return True
+        provided = self._extract_api_key(self.headers)
+        expected = self.password.encode("utf-8")
+        ok = provided is not None and hmac.compare_digest(
+            provided.encode("utf-8"), expected)
+        if not ok:
+            _log(f"{self.address_string()} - rejected {self.command} {self.path}: "
+                 f"missing or invalid API key")
+            body = json.dumps({
+                "error": {"message": (
+                    "Invalid or missing API key. When --password is set on the "
+                    "proxy, clients must present it as their API key — e.g. "
+                    "'Authorization: Bearer <password>' or 'x-api-key: <password>'.")}
+            }).encode("utf-8")
+            try:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("WWW-Authenticate", 'Bearer realm="ollama-proxy"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client already gone — nothing to deliver.
+        return ok
+
+    def _check_basic_auth(self):
+        """HTTP Basic auth gate for web UI endpoints. Returns True when auth is
+        disabled OR credentials match; otherwise sends 401 + WWW-Authenticate so
+        browsers show the standard username/password pop-up."""
+        if not self._auth_enabled():
+            return True
+        provided = self.headers.get("Authorization", "")
+        expected_user = self.auth_user.encode("utf-8")
+        expected_pw = self.password.encode("utf-8")
+        ok = False
+        if isinstance(provided, str) and provided.lower().startswith("basic "):
+            token = provided[6:].strip()
+            try:
+                decoded = base64.b64decode(token).decode("utf-8", "replace")
+                user, _, pw = decoded.partition(":")
+                ok = (hmac.compare_digest(user.encode("utf-8"), expected_user)
+                      and hmac.compare_digest(pw.encode("utf-8"), expected_pw))
+            except Exception:
+                ok = False  # malformed base64 / non-UTF8 → treat as failure
+        if not ok:
+            _log(f"{self.address_string()} - rejected {self.command} {self.path}: "
+                 f"missing or invalid Basic auth credentials")
+            msg = ("Authentication required. Use HTTP Basic auth with username "
+                   f"'{self.auth_user}' and the proxy password.")
+            body = json.dumps({"error": {"message": msg}}).encode("utf-8")
+            try:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                realm = (self.auth_user or "ollama-proxy").replace('"', "")[:64]
+                self.send_header("WWW-Authenticate", f'Basic realm="{realm}"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client already gone — nothing to deliver.
+        return ok
+
+    @classmethod
+    def _redact_argv(cls) -> list[str]:
+        """Copy of sys.argv with any entry equal to the shared secret replaced by
+        REDACTED so /_status never leaks it."""
+        if not cls.password:
+            return list(sys.argv)
+        pw = cls.password
+        out = []
+        for i, a in enumerate(sys.argv):
+            if a == pw or (i > 0 and sys.argv[i - 1] in ("--password", "-p") and a):
+                out.append("REDACTED")
+            else:
+                out.append(a)
+        return out
 
     def _send_error_body(self, code, message):
         body = json.dumps({"error": {"message": message}}).encode("utf-8")
@@ -1285,6 +1433,17 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         return None
 
     def do_POST(self):
+        # --- Authentication gate (only active when --password was set). ---
+        # /_abort is a control/web endpoint → HTTP Basic auth; proxied calls → API key.
+        if not self._auth_enabled():
+            pass  # no password configured — allow everything through unchanged
+        elif self.path.rstrip("/") == "/_abort":
+            if not self._check_basic_auth():
+                return
+        else:
+            if not self._check_api_key():
+                return
+
         # --- Control endpoint: abort all in-flight upstream requests. ---
         if self.path.rstrip("/") == "/_abort":
             n = abort_all_upstreams("manual /_abort request")
@@ -1660,6 +1819,16 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
 
+        # --- Authentication gate (only active when --password was set). ---
+        # /_health stays open so external monitors can probe liveness without a secret;
+        # everything else requires either Basic auth (web UI) or an API key (proxied GETs).
+        if path != "/_health":
+            if path in self._WEB_UI_PATHS:
+                if not self._check_basic_auth():
+                    return
+            elif not self._check_api_key():
+                return
+
         # --- Web UI: live log viewer. ---
         if path == "/_log":
             self._send_html(_LOG_PAGE_HTML)
@@ -1683,9 +1852,11 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 # Runtime state — identical to GET /_health (shared builder) so the two endpoints never disagree.
                 **_health_payload(),
-                # CLI parameters the proxy was started with: raw argv plus parsed values in effect.
+                # CLI parameters the proxy was started with: raw argv (secret redacted) plus parsed values in effect.
                 "cli": {
-                    "argv": sys.argv,
+                    "argv": self._redact_argv(),
+                    "password_set": bool(self.password),
+                    "auth_user": self.auth_user if self.password else None,
                     "model": self.target_model,
                     "port": self.listen_port,
                     "ollama_url": self.ollama_url,
@@ -1835,6 +2006,9 @@ def main():
     RewriteProxyHandler.ollama_url = args.ollama_url.rstrip("/")
     RewriteProxyHandler.filter_windows_tools_enabled = args.filter_windows_tools
     RewriteProxyHandler.default_effort = args.default_effort
+    # Optional shared-secret auth (empty password disables it entirely).
+    RewriteProxyHandler.password = args.password or ""
+    RewriteProxyHandler.auth_user = args.auth_user or DEFAULT_AUTH_USER
     # Absolute path so /_log tailing works regardless of the CWD the proxy
     # was started from.
     RewriteProxyHandler.log_file_path = os.path.abspath(args.log_file)
@@ -1872,6 +2046,10 @@ def main():
     print(f"  -> default reasoning_effort: "
           f"{args.default_effort or '(none, only via -nothink/-think-<level> ID)'}")
     print(f"  -> filter Windows tools: {args.filter_windows_tools}")
+    if args.password:
+        print(f"  -> authentication: ENABLED (API key + Basic auth user '{args.auth_user}')")
+    else:
+        print(f"  -> authentication: disabled (no --password supplied)")
     if args.log_file != "/dev/null":
         print(f"  -> log file:       {args.log_file} (stdout+stderr duplicated)")
     print(f"  -> web UI:         http://localhost:{args.port}/_log   "

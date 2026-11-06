@@ -48,7 +48,48 @@ Code BYOM entries at `http://127.0.0.1:8050/v1`.
 | `--ollama-url` | `http://127.0.0.1:11434` | Backend Ollama base URL. |
 | `--default-effort` | *(none)* | `reasoning_effort` injected when the id has no directive (`none\|low\|medium\|high\|max`). |
 | `--filter-windows-tools` | off | Strip Windows-native tools from chat-completion payloads (Linux-only envs). |
+| `--password` | *(empty)* | Shared secret enabling authentication. When set: proxied calls must present it as their API key (`Authorization: Bearer <pw>` or `x-api-key: <pw>`); web UI endpoints require HTTP Basic auth (username = `--auth-user`, password = this value). Empty/disabled by default. |
+| `--auth-user` | `proxy` | Username for the web UI's HTTP Basic-auth prompt when `--password` is set. The password itself always comes from `--password`. |
 | `--log-file` | `ollama_proxy.log` | Duplicate stdout+stderr to this file (pass `/dev/null` to disable). |
+
+## Optional authentication (`--password`)
+
+By default the proxy has **no** protection — fine for a loopback-only dev container, but it binds `0.0.0.0`, so if you expose it on a LAN or over a tunnel you should turn on auth with a single flag:
+
+```bash
+python3 ollama_proxy.py --model qwen3-coder --port 8050 \
+    --filter-windows-tools \
+    --password 's3cr3t-pw'          # enables auth; omit to run unprotected
+    # --auth-user admin             # optional: change the Basic-auth username (default "proxy")
+```
+
+When `--password` is set, two mechanisms are active at once:
+
+- **Proxied upstream calls** (VS Code BYOM / Cline / any OpenAI-compat client) must present the secret as their **API key**. The proxy accepts either header shape and compares in constant time (`hmac.compare_digest`):
+  - `Authorization: Bearer <password>` — what VS Code sends from the model group's `apiKey` field, or
+  - `x-api-key: <password>`.
+
+  A missing/mismatched key → `401` with a JSON error body explaining both accepted schemes. This is exactly where VS Code's "enter an API key" box goes: put your `--password` value there.
+- **Web UI endpoints** (`/_log`, `/_status`, `/_log/tail`, `/_status/data`) use standard **HTTP Basic auth**, so browsers show the usual username/password pop-up. Username = `--auth-user` (default `proxy`), password = the same `--password`. A failed attempt returns `401` + a `WWW-Authenticate: Basic realm="..."` challenge.
+
+Endpoints that stay open regardless of auth state:
+
+| Endpoint | Why it stays open |
+|----------|-------------------|
+| `GET /_health` | Liveness probe for monitors/auto-restart scripts; must work without a secret. |
+
+Everything else (proxied GET/POST passthrough, `/_abort`, web UI) is gated when a password is configured. The startup banner prints whether authentication is enabled and which Basic-auth user to expect, e.g.:
+
+```
+-> authentication: ENABLED (API key + Basic auth user 'proxy')
+```
+
+Security notes:
+
+- Comparison uses constant-time hashing on both sides — no timing oracle from the key check itself.
+- The secret is **redacted** in `GET /_status/data`: the raw CLI `argv` shows `REDACTED` where your password value would appear, and only booleans (`password_set`, `auth_user`) are exposed there. It never appears in log lines either.
+- Auth is all-or-nothing per request; there is no per-endpoint allow-list beyond the `/_health` exemption above.
+- This protects against *unauthorised use* of an exposed proxy; it does not encrypt traffic. If you expose across an untrusted network, still prefer TLS termination or a tunnel in front of it.
 
 ## Thinking directives (model-id encoding)
 
@@ -222,7 +263,7 @@ Two self-contained HTML pages (inline CSS/JS, no external assets) served by the 
 - **`http://localhost:<port>/_log`** — live log viewer in a full-window scroll area. Polls `GET /_log/tail?lines=2000` every 2 s; timestamps are dimmed, error/exception/fatal lines red, warnings amber. Auto-sticks to the bottom while new lines arrive; status dot turns amber if polling fails. The tail is read from the *end* of the log file (`--log-file`, default `ollama_proxy.log`) so it stays fast regardless of file size and tolerates a missing/truncated file (returns an empty list).
 - **`http://localhost:<port>/_status`** — dashboard with four tables:
   - **Runtime state** (linked to `/_health`) — live proxy health: status, active upstream connections, consecutive-failure streak (red when >0), recovery threshold, process uptime. Served from the same shared builder as `GET /_health`, so both endpoints always agree.
-  - **Proxy configuration** — the CLI parameters the proxy was started with: raw `argv` plus the parsed values in effect (`model`, `port`, `ollama_url`, `default_effort`, `filter_windows_tools`, `log_file`).
+  - **Proxy configuration** — the CLI parameters the proxy was started with: raw `argv` (with any `--password` value shown as `REDACTED`) plus the parsed values in effect (`model`, `port`, `ollama_url`, `default_effort`, `filter_windows_tools`, `log_file`, and — when auth is on — booleans for whether a password is set and which Basic-auth user).
   - **GPU** — per-GPU name, temperature, power draw, memory usage from `nvidia-smi --query-gpu=...` (memory shown as a bar; red above 85 %). If `nvidia-smi` is missing/fails, an error line is shown instead.
   - **Loaded models** — full output of `ollama ps` (NAME, ID, SIZE, PROCESSOR, CONTEXT, RUNNER, UNTIL), with wrapped continuation lines folded back into the last column.
 
@@ -268,5 +309,4 @@ export OLLAMA_MAX_QUEUE=512
 - Retries only happen **before any response byte is sent** to the client; once
   streaming starts a re-issue isn't possible (kill-and-respawn covers the
   non-streaming case where nothing was sent yet).
-- The proxy binds `0.0.0.0` — fine for a local dev container, but don't expose
-  it unauthenticated on an open network.
+- The proxy binds `0.0.0.0` — fine for a local dev container, but if you expose it on a LAN or tunnel, enable shared-secret auth with `--password` (see [Optional authentication](#optional-authentication---password)) so unauthorised clients can't use your model slot or read the log/status pages. Note this authenticates but does not encrypt; prefer TLS termination or a tunnel over an untrusted network too.

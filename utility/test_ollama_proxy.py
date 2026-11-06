@@ -2093,6 +2093,195 @@ class WebUIEndpointTests(ProxyIntegrationBase):
 
 
 # ===================================================================
+# Authentication (shared-secret / password) tests — unit + integration
+# ===================================================================
+
+def _req(method: str, url: str, body: bytes | None = None,
+         headers: dict | None = None, timeout: float = 15):
+    """Generic request helper returning (status, headers_dict, body_bytes)."""
+    hdrs = {} if body is None else {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _basic(user: str, pw: str) -> str:
+    import base64 as _b64
+    return "Basic " + _b64.b64encode(f"{user}:{pw}".encode()).decode("ascii")
+
+
+class AuthUnitTests(unittest.TestCase):
+    """Direct tests of the handler's auth helpers (no subprocess needed)."""
+
+    def setUp(self):
+        # Snapshot class attrs so we can restore them after each test.
+        self._saved_pw = ollama_proxy.RewriteProxyHandler.password
+        self._saved_user = ollama_proxy.RewriteProxyHandler.auth_user
+
+    def tearDown(self):
+        ollama_proxy.RewriteProxyHandler.password = self._saved_pw
+        ollama_proxy.RewriteProxyHandler.auth_user = self._saved_user
+
+    def test_extract_api_key_bearer(self):
+        h = {"Authorization": "Bearer s3cret"}
+        self.assertEqual(ollama_proxy.RewriteProxyHandler._extract_api_key(h), "s3cret")
+
+    def test_extract_api_key_xapikey(self):
+        h = {"x-api-key": "tok123"}
+        self.assertEqual(ollama_proxy.RewriteProxyHandler._extract_api_key(h), "tok123")
+
+    def test_extract_api_key_none_when_absent(self):
+        self.assertIsNone(ollama_proxy.RewriteProxyHandler._extract_api_key({}))
+
+    def test_redact_argv_replaces_secret_value(self):
+        H = ollama_proxy.RewriteProxyHandler
+        H.password = "hunter2"
+        saved_argv = list(sys.argv)
+        try:
+            sys.argv = ["ollama_proxy.py", "--model", "m", "--password", "hunter2"]
+            redacted = H._redact_argv()
+            self.assertNotIn("hunter2", redacted)
+            self.assertIn("REDACTED", redacted)
+            # The flag itself stays visible; only the value is masked.
+            self.assertIn("--password", redacted)
+        finally:
+            sys.argv = saved_argv
+
+    def test_redact_argv_noop_without_password(self):
+        H = ollama_proxy.RewriteProxyHandler
+        H.password = ""
+        saved_argv = list(sys.argv)
+        try:
+            sys.argv = ["ollama_proxy.py", "--model", "m"]
+            self.assertEqual(H._redact_argv(), ["ollama_proxy.py", "--model", "m"])
+        finally:
+            sys.argv = saved_argv
+
+
+class AuthIntegrationTests(ProxyIntegrationBase):
+    """End-to-end behaviour of --password across proxied + web UI endpoints."""
+
+    PW = "s3cr3t-pw"
+
+    def _start_authed(self, user="proxy"):
+        self.extra_args = ["--password", self.PW] + (["--auth-user", user] if user != "proxy" else [])
+        return self._start_proxy()
+
+    # --- Proxied calls require the API key ---------------------------------
+
+    def test_post_rejected_without_key(self):
+        self._start_authed()
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        status, headers, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", body)
+        self.assertEqual(status, 401)
+        err = json.loads(resp_body)["error"]["message"]
+        self.assertIn("API key", err)
+
+    def test_post_accepted_with_bearer_key(self):
+        self._start_authed()
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        status, _, _ = http_post(
+            f"{self.proxy_url}/v1/chat/completions", body,
+            headers={"Authorization": f"Bearer {self.PW}"})
+        self.assertEqual(status, 200)
+
+    def test_post_accepted_with_xapikey_header(self):
+        self._start_authed()
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        status, _, _ = http_post(
+            f"{self.proxy_url}/v1/chat/completions", body,
+            headers={"x-api-key": self.PW})
+        self.assertEqual(status, 200)
+
+    def test_post_rejected_with_wrong_key(self):
+        self._start_authed()
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        status, _, resp_body = http_post(
+            f"{self.proxy_url}/v1/chat/completions", body,
+            headers={"Authorization": "Bearer wrong-password"})
+        self.assertEqual(status, 401)
+
+    def test_get_proxied_requires_key(self):
+        """GET passthrough (e.g. /api/tags) also needs the API key when auth is on."""
+        self._start_authed()
+        status_noauth, _, _ = http_get(f"{self.proxy_url}/api/tags")
+        self.assertEqual(status_noauth, 401)
+
+        status_ok, _, _ = _req("GET", f"{self.proxy_url}/api/tags",
+                               headers={"Authorization": f"Bearer {self.PW}"})
+        self.assertEqual(status_ok, 200)
+
+    # --- Web UI uses HTTP Basic auth ---------------------------------------
+
+    def test_status_data_requires_basic_auth(self):
+        self._start_authed()
+        status, headers, resp_body = http_get(f"{self.proxy_url}/_status/data")
+        self.assertEqual(status, 401)
+        www = headers.get("WWW-Authenticate", "") or ""
+        self.assertTrue(www.lower().startswith("basic"), f"expected Basic challenge, got: {www!r}")
+
+    def test_status_data_accepted_with_correct_basic(self):
+        self._start_authed()
+        status, _, body = _req("GET", f"{self.proxy_url}/_status/data",
+                               headers={"Authorization": _basic("proxy", self.PW)})
+        self.assertEqual(status, 200)
+        json.loads(body)  # must be valid JSON
+
+    def test_status_data_rejected_with_wrong_password(self):
+        self._start_authed()
+        status, _, _ = _req("GET", f"{self.proxy_url}/_status/data",
+                            headers={"Authorization": _basic("proxy", "nope")})
+        self.assertEqual(status, 401)
+
+    def test_custom_auth_user_respected(self):
+        """--auth-user changes the expected Basic-auth username."""
+        self._start_authed(user="admin")
+        # Correct user + password → OK.
+        ok, _, _ = _req("GET", f"{self.proxy_url}/_status/data",
+                        headers={"Authorization": _basic("admin", self.PW)})
+        self.assertEqual(ok, 200)
+        # Old default user now rejected.
+        bad, _, _ = _req("GET", f"{self.proxy_url}/_status/data",
+                         headers={"Authorization": _basic("proxy", self.PW)})
+        self.assertEqual(bad, 401)
+
+    def test_abort_endpoint_requires_basic_auth(self):
+        self._start_authed()
+        status_noauth, _, _ = http_post(f"{self.proxy_url}/_abort")
+        self.assertEqual(status_noauth, 401)
+
+        status_ok, _, body = http_post(
+            f"{self.proxy_url}/_abort", headers={"Authorization": _basic("proxy", self.PW)})
+        self.assertEqual(status_ok, 200)
+        self.assertIn("aborted", json.loads(body))
+
+    # --- /_health stays open; argv is redacted -----------------------------
+
+    def test_health_open_even_when_auth_enabled(self):
+        """Liveness probe must not require a secret."""
+        self._start_authed()
+        status, _, body = http_get(f"{self.proxy_url}/_health")
+        self.assertEqual(status, 200)
+        json.loads(body)
+
+    def test_status_data_redacts_password_in_argv(self):
+        self._start_authed()
+        status, _, body = _req("GET", f"{self.proxy_url}/_status/data",
+                               headers={"Authorization": _basic("proxy", self.PW)})
+        self.assertEqual(status, 200)
+        cli = json.loads(body)["cli"]
+        argv_str = " ".join(cli["argv"]) if isinstance(cli.get("argv"), list) else str(cli.get("argv"))
+        self.assertNotIn(self.PW, argv_str, "password leaked into /_status/data argv")
+        self.assertTrue(cli.get("password_set") is True)
+        self.assertEqual(cli.get("auth_user"), "proxy")
+
+
+# ===================================================================
 # Runner
 # ===================================================================
 

@@ -565,11 +565,21 @@ fi
 # Pre-warm the model.
 ollama run qwen3-coder ""
 
+# Optional shared-secret auth. Leave PROXY_PASSWORD empty for an unauthenticated local-only setup (the default). Set it if you expose port 8080 on a LAN/tunnel — then VS Code BYOM must use this value as its API key, and the web UI (/_log, /_status) asks for username PROXY_AUTH_USER + this password via HTTP Basic auth. See utility/ollama_proxy.md → "Optional authentication".
+PROXY_PASSWORD=""          # e.g. 's3cr3t-pw' to enable auth; empty = disabled
+PROXY_AUTH_USER="proxy"    # Basic-auth username shown in the browser pop-up
+
+AUTH_ARGS=()
+if [ -n "$PROXY_PASSWORD" ]; then
+    AUTH_ARGS=(--password "$PROXY_PASSWORD" --auth-user "$PROXY_AUTH_USER")
+fi
+
 # Start the proxy. The proxy tees its own stdout/stderr into --log-file (so /_log web UI works). We redirect shell-level stdout/stderr to /dev/null so nothing spills to the terminal; all logging goes through the internal tee to the real file.
 python3 -u ollama_proxy.py \
     --model qwen3-coder \
     --port 8050 \
     --filter-windows-tools \
+    "${AUTH_ARGS[@]}" \
     --log-file /tmp/ollama_proxy.log \
     > /dev/null 2>&1 &
 
@@ -577,6 +587,7 @@ PROXY_PID=$!
 
 echo "Ollama and proxy are running."
 echo "Proxy: http://127.0.0.1:8050"
+[ -n "$PROXY_PASSWORD" ] && echo "Auth: ENABLED — use '$PROXY_AUTH_USER' + your PROXY_PASSWORD as the BYOM API key / Basic-auth password." || echo "Auth: disabled (no PROXY_PASSWORD set)."
 echo "Press Ctrl-C to stop."
 
 wait "$OLLAMA_PID"
@@ -594,7 +605,7 @@ Start the complete environment:
 ./start_llm.sh
 ```
 
-The script starts Ollama, waits for its API, pre-warms the model, and starts the proxy.
+The script starts Ollama, waits for its API, pre-warms the model, and starts the proxy. If you set `PROXY_PASSWORD`, remember to put that same value into VS Code's BYOM **API key** field (and use it as the Basic-auth password on the web UI) — see Phase 10 below.
 
 Logs:
 
@@ -658,7 +669,7 @@ In VS Code:
 1. Make sure the GitHub Copilot extension is installed (it already is, since `devcontainer.json` lists it).
 2. When the extension asks you to select a BYOK model, click it — this opens the **"Byok Utility Model Default"** setting (findable later by ID `chat.byokUtilityModelDefault`). Select **"Main Agent Model"** instead of GitHub Copilot, so all agent work uses your local endpoint.
 3. In the Copilot sidebar's model selector, click **"Manage models"**.
-4. Click the blue **"Add Models"** button and choose **"Custom Endpoint"**. Enter any group name and any random API key (the value is ignored; Ollama doesn't authenticate). For API type choose **"Chat Completions API"**.
+4. Click the blue **"Add Models"** button and choose **"Custom Endpoint"**. Enter any group name and an API key — if you left `PROXY_PASSWORD` empty in `start_llm.sh`, type anything (it's ignored); **if you set `PROXY_PASSWORD`, enter that exact value here**, because the proxy will reject requests whose API key doesn't match it (see [Optional authentication](utility/ollama_proxy.md#optional-authentication---password)). For API type choose **"Chat Completions API"**.
 5. This opens a JSON config with an empty template. Fill in the config section like this:
 
 ```json
@@ -729,7 +740,7 @@ Setup steps:
    - **Sandbox-to-sandbox (external client):** use `http://<host_machine_ip>:8080` — e.g., `http://192.168.10.10:8080`. This is the primary recommended endpoint when your dev laptop connects over LAN to a separate LLM host box. Do NOT use `localhost` here; that resolves inside *your* container, not the remote one.
    - **Same-box / in-container client:** use `http://localhost:8050` for proxy access, or `http://localhost:8081` for direct Ollama native API (expose port 8081 first via [Optional: Expose the native Ollama API](#optional-expose-the-native-ollama-api)). Direct connection tends to be more stable than going through Copilot, so it's fully usable even without the proxy.
    - **Note:** if you get 404 errors on requests, append `/v1` to the base URL → e.g., `http://localhost:8050/v1` or `http://<host-ip>:8080/v1`. On some machines Cline doesn't do this automatically.
-6. **API Key:** type anything — it's ignored.
+6. **API Key:** if routing through the proxy and you set `PROXY_PASSWORD`, enter that exact value (the proxy rejects mismatched keys); otherwise type anything — raw Ollama ignores it entirely.
 7. **Model ID:** don't pick from the dropdown; set it manually. Use `qwen3-coder` when connecting directly to exposed Ollama, or one of the thinking presets parsed by the proxy (e.g., `qwen3-coder-think-high`) when going through the proxy.
 8. Open the **"Model Configuration"** section and set:
    - Context Window Size: `76000` (or your chosen budget)

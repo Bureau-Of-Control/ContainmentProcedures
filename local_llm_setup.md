@@ -336,11 +336,21 @@ fi
 # Pre-warm the model.
 ollama run qwen3-coder ""
 
+# Optional shared-secret auth. Leave PROXY_PASSWORD empty for an unauthenticated local-only setup (the default). Set it if you expose port 8080 on a LAN/tunnel — then VS Code BYOM must use this value as its API key, and the web UI (/_log, /_status) asks for username PROXY_AUTH_USER + this password via HTTP Basic auth. See utility/ollama_proxy.md → "Optional authentication".
+PROXY_PASSWORD=""          # e.g. 's3cr3t-pw' to enable auth; empty = disabled
+PROXY_AUTH_USER="proxy"    # Basic-auth username shown in the browser pop-up
+
+AUTH_ARGS=()
+if [ -n "$PROXY_PASSWORD" ]; then
+    AUTH_ARGS=(--password "$PROXY_PASSWORD" --auth-user "$PROXY_AUTH_USER")
+fi
+
 # Start the proxy. The proxy tees its own stdout/stderr into --log-file (so /_log web UI works). We redirect shell-level stdout/stderr to /dev/null so nothing spills to the terminal; all logging goes through the internal tee to the real file.
 python3 -u ollama_proxy.py \
     --model qwen3-coder \
     --port 8050 \
     --filter-windows-tools \
+    "${AUTH_ARGS[@]}" \
     --log-file /tmp/ollama_proxy.log \
     > /dev/null 2>&1 &
 
@@ -348,6 +358,7 @@ PROXY_PID=$!
 
 echo "Ollama and proxy are running."
 echo "Proxy: http://127.0.0.1:8050"
+[ -n "$PROXY_PASSWORD" ] && echo "Auth: ENABLED — use '$PROXY_AUTH_USER' + your PROXY_PASSWORD as the BYOM API key / Basic-auth password." || echo "Auth: disabled (no PROXY_PASSWORD set)."
 echo "Press Ctrl-C to stop."
 
 wait "$OLLAMA_PID"
@@ -360,7 +371,7 @@ chmod +x start_llm.sh
 ./start_llm.sh
 ```
 
-As soon as execution finishes you should be able to start working (the script pre-warms the model before returning control). To stop everything, just Ctrl-C the terminal running it.
+As soon as execution finishes you should be able to start working (the script pre-warms the model before returning control). To stop everything, just Ctrl-C the terminal running it. If you set `PROXY_PASSWORD`, remember to put that same value into VS Code's BYOM **API key** field (and use it as the Basic-auth password on the web UI) in the client-configuration steps below.
 
 #### About Proxy tool
 
@@ -442,7 +453,7 @@ This option works best overall. First I've tried this setup with Continue.dev ex
 1. Open VS Code, and make sure you have the GitHub Copilot extension installed (should be installed already as it's defined in devcontainer.json). Note that you DON'T need a paid subcsription or even a free account at all. Extension is fully capable to use your custom BYOM model for tasks planner and chat responses. Signing in is not necessary and even not advised, as if you will sign in, then by default VS Code will use Microsoft's own GitHub Copilot chat model for normal prompts and planning tasks and will only offload difficult tasks to your custom model. Bad thing about it is that GitHub Copilot model is often overloaded/rate-limited and slow to respond, which is wasting your time.
 2. When extension will ask you to select BYOK model, click it, and it will open up setting "Byok Utility Model Default" (you can always find this setting later by ID: `chat.byokUtilityModelDefault`), select in there "Main Agent Model" instead of GitHub Copilot.
 3. In Copilot sidebar model selection click "Manage models".
-4. Click blue "Add Models" button and Choose "Custom Endpoint". Enter any group name and any random API key. For API type choose "Chat Completions API".
+4. Click blue "Add Models" button and Choose "Custom Endpoint". Enter any group name and an API key — if you left `PROXY_PASSWORD` empty in `start_llm.sh`, type anything (it's ignored); **if you set `PROXY_PASSWORD`, enter that exact value here**, because the proxy will reject requests whose API key doesn't match it (see [Optional authentication](utility/ollama_proxy.md#optional-authentication---password)). For API type choose "Chat Completions API".
 5. This will open a JSON config with empty template, fill in the config section like this:
 
 ```json
@@ -503,8 +514,8 @@ Looking for alternatives to GitHub Copilot, I've also checked some other extensi
 4. API Provider: choose "OpenAI Compatible" from the list.
 5. Base URL: insert `http://192.168.10.10:8080` if you want to work through proxy, or `http://192.168.10.10:8081` to connect directly to Ollama instance. Make sure to expose the Ollama to host network first as described above if you want to use direct connection. Direct connection in this case works much better and more stable than in the case of Copilot extension, so it's totally usable even without proxy.
 **Note:** if you're getting errors 404 on requests, modify base URL by adding /v1 to it, like this: `http://192.168.10.10:8080/v1` - for some reason, sometimes on some machines Cline doesn't do it automatically.
-6. API Key: type anything in there.
-7. Model ID: don't select ones provided by drop-down list, set `qwen3-coder` manually in case you're setting it up to work directly with exposed Ollama, or if setting it up to work through proxy, use one of the thinking presents parsed by proxy, like `qwen3-coder-think-high`.
+6. API Key: if routing through the proxy and you set `PROXY_PASSWORD`, enter that exact value (the proxy rejects mismatched keys); otherwise type anything — raw Ollama ignores it entirely.
+7. Model ID: don't select ones provided by drop-down list, set `qwen3-coder` manually in case you're setting it up to work directly with exposed Ollama, or if setting it up to work through proxy, use one of the thinking presets parsed by proxy, like `qwen3-coder-think-high`.
 8. Open "Model Configuration" section and set the following values:
   - Context Window Size: 80000
   - Max Output Tokens: Do not set for thinking models
@@ -523,7 +534,7 @@ Note: This should be possible but I was unable to configure it yet - relevant op
    ```
    http://192.168.10.10:8080
    ```
-5. Enter a dummy API key if required (e.g., ollama).
+5. Enter an API key — if you set `PROXY_PASSWORD` in `start_llm.sh`, use that exact value; otherwise any placeholder works (e.g., `ollama`).
 6. Click Add Model, enter the exact name of your pulled model (e.g., qwen3-coder), and toggle it on. Turn off any cloud models you don't intend to use.
 
 Note: since traffic goes through the proxy, Cursor will also benefit from the thinking directives — add extra model entries with IDs like `qwen3-coder-nothink` or `qwen3-coder-think-high` if your client lets you register multiple IDs against the same base URL.
