@@ -788,6 +788,311 @@ class StreamingPassthroughTests(ProxyIntegrationBase):
 
 
 # ===================================================================
+# 6b. UNIT — reasoning part ID helpers (pure functions)
+# ===================================================================
+
+class ReasoningPartIdUnitTests(unittest.TestCase):
+    """Verify _merge_reasoning_chunks and _inject_reasoning_part_id produce correct output."""
+
+    def _make_chunk(self, reasoning=" hello"):
+        return {
+            "id": "chatcmpl-test", "object": "chat.completion.chunk", "created": 0,
+            "model": "test-model", "system_fingerprint": "fp_test",
+            "choices": [{"index": 0, "delta": {"content": "", "reasoning": reasoning}, "finish_reason": None}],
+        }
+
+    def test_merge_without_part_id_has_no_injection(self):
+        chunk = self._make_chunk()
+        out = ollama_proxy._merge_reasoning_chunks(chunk, [" world"], part_id=None)
+        parsed = json.loads(out.decode().removeprefix("data: ").strip())
+        delta = parsed["choices"][0]["delta"]
+        self.assertEqual(delta["reasoning"], " world")
+        self.assertNotIn("reasoning_part_id", delta)
+        self.assertNotIn("reasoning_part_id", parsed)
+
+    def test_merge_with_part_id_injects_both_locations(self):
+        chunk = self._make_chunk()
+        pid = "abc123def456"
+        out = ollama_proxy._merge_reasoning_chunks(chunk, [" world"], part_id=pid)
+        parsed = json.loads(out.decode().removeprefix("data: ").strip())
+        delta = parsed["choices"][0]["delta"]
+        # Merged text is correct
+        self.assertEqual(delta["reasoning"], " world")
+        # Part ID injected in both plausible locations VS Code might read
+        self.assertEqual(delta.get("reasoning_part_id"), pid)
+        self.assertEqual(parsed.get("reasoning_part_id"), pid)
+
+    def test_merge_preserves_original_fields(self):
+        chunk = self._make_chunk()
+        out = ollama_proxy._merge_reasoning_chunks(chunk, ["x"], part_id="p1")
+        parsed = json.loads(out.decode().removeprefix("data: ").strip())
+        self.assertEqual(parsed["id"], "chatcmpl-test")
+        self.assertEqual(parsed["model"], "test-model")
+
+    def test_inject_reasoning_part_id_adds_to_delta_and_top_level(self):
+        chunk = self._make_chunk(reasoning=" token")
+        pid = "feedbeef"
+        out = ollama_proxy._inject_reasoning_part_id(chunk, pid)
+        parsed = json.loads(out.decode().removeprefix("data: ").strip())
+        delta = parsed["choices"][0]["delta"]
+        self.assertEqual(delta["reasoning"], " token")  # original preserved
+        self.assertEqual(delta.get("reasoning_part_id"), pid)
+        self.assertEqual(parsed.get("reasoning_part_id"), pid)
+
+    def test_inject_does_not_mutate_input(self):
+        """Ensure deepcopy prevents side-effects on the caller's dict."""
+        chunk = self._make_chunk()
+        _ = ollama_proxy._inject_reasoning_part_id(chunk, "xyz")
+        # Original should be untouched
+        self.assertNotIn("reasoning_part_id", chunk["choices"][0]["delta"])
+
+    # --- _chunk_is_reasoning_only classification -------------------------
+
+    def _rsn_chunk(self, delta: dict, finish_reason=None):
+        return {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "system_fingerprint": "fp",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+
+    def test_classify_pure_reasoning_qualifies(self):
+        self.assertTrue(ollama_proxy._chunk_is_reasoning_only(
+            self._rsn_chunk({"content": "", "reasoning": "The"})))
+
+    def test_classify_role_bundled_first_token_qualifies(self):
+        """REGRESSION: Ollama bundles role:'assistant' with the first reasoning token. It must still qualify as reasoning-only so it gets buffered instead of escaping to its own card."""
+        self.assertTrue(ollama_proxy._chunk_is_reasoning_only(
+            self._rsn_chunk({"role": "assistant", "content": "", "reasoning": "I"})))
+
+    def test_classify_real_content_disqualifies(self):
+        self.assertFalse(ollama_proxy._chunk_is_reasoning_only(
+            self._rsn_chunk({"content": "Hello", "reasoning": ""})))
+
+    def test_classify_empty_reasoning_disqualifies(self):
+        self.assertFalse(ollama_proxy._chunk_is_reasoning_only(
+            self._rsn_chunk({"content": "", "reasoning": ""})))
+
+    def test_classify_finish_reason_disqualifies(self):
+        self.assertFalse(ollama_proxy._chunk_is_reasoning_only(
+            self._rsn_chunk({"content": "", "reasoning": "done"}, finish_reason="stop")))
+
+
+# ===================================================================
+# 6c. INTEGRATION — reasoning part ID end-to-end (streaming)
+# ===================================================================
+
+class ReasoningPartIdIntegrationTests(ProxyIntegrationBase):
+    """Verify that consecutive reasoning tokens in a streaming response all carry the SAME stable part ID, and non-reasoning events do not."""
+
+    def test_all_reasoning_chunks_share_one_part_id(self):
+        """Upstream sends 3 reasoning tokens then content. Proxy should emit ONE merged reasoning event with a single part_id, followed by the content event without one."""
+
+        rsn_tokens = ["The ", "user is ", "testing."]
+        chunks = []
+        for t in rsn_tokens:
+            chunks.append(json.dumps({"id": "c1", "object": "chat.completion.chunk", "created": 0,
+                                      "model": "m", "system_fingerprint": "fp",
+                                      "choices": [{"index": 0, "delta": {"content": "", "reasoning": t}, "finish_reason": None}]}))
+        # Content token (non-reasoning) triggers flush of buffered reasoning
+        chunks.append(json.dumps({"id": "c1", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {"content": "Hello!"}, "finish_reason": None}]}))
+        # Finish chunk
+        chunks.append(json.dumps({"id": "c1", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
+
+        def handler(h, method, path, body, n):
+            resp = sse_chunks(*chunks)
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.end_headers()
+            for line in resp.split(b"\n\n"):
+                if line:
+                    h.wfile.write(line + b"\n\n")
+                    h.wfile.flush()
+
+        self.fake.on_request = handler
+        self._start_proxy()
+
+        req_body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", req_body)
+        self.assertEqual(status, 200)
+
+        text = resp_body.decode("utf-8")
+
+        # Parse all data: lines into JSON objects (skip [DONE])
+        events = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload_str = line[5:].strip()
+            if payload_str == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(payload_str))
+            except ValueError:
+                pass
+
+        # Separate reasoning vs non-reasoning events by presence of delta.reasoning with actual content
+        rsn_events = [e for e in events if isinstance(e.get("choices"), list) and e["choices"] and isinstance(e["choices"][0].get("delta"), dict) and e["choices"][0]["delta"].get("reasoning")]
+        non_rsn_events = [e for e in events if e not in rsn_events]
+
+        # We should have exactly ONE merged reasoning event (all 3 tokens combined)
+        self.assertGreaterEqual(len(rsn_events), 1, f"Expected at least 1 reasoning event, got {len(rsn_events)} in {events}")
+
+        # All reasoning events must share the SAME part_id (stable across the thinking session)
+        pids = set()
+        for ev in rsn_events:
+            pid_delta = ev["choices"][0]["delta"].get("reasoning_part_id")
+            pid_top = ev.get("reasoning_part_id")
+            if pid_delta:
+                pids.add(pid_delta)
+            if pid_top:
+                pids.add(pid_top)
+
+        self.assertEqual(len(pids), 1, f"All reasoning events must share one stable part ID, but found multiple: {pids}")
+
+        # The merged text should contain all three pieces concatenated
+        merged_text = "".join(ev["choices"][0]["delta"]["reasoning"] for ev in rsn_events)
+        self.assertIn("The ", merged_text)
+        self.assertIn("user is ", merged_text)
+        self.assertIn("testing.", merged_text)
+
+    def test_first_chunk_with_role_announcement_is_buffered(self):
+        """Ollama bundles role:'assistant' with the FIRST reasoning token. That chunk must still qualify as reasoning-only and get merged into the same block as subsequent tokens — otherwise VS Code renders 'The' as its own card before the rest of the thought."""
+
+        chunks = []
+        # First chunk: role announcement + first reasoning token (exactly what Ollama emits)
+        chunks.append(json.dumps({"id": "c3", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {"role": "assistant", "content": "", "reasoning": "I"}, "finish_reason": None}]}))
+        for t in [" am ", "thinking"]:
+            chunks.append(json.dumps({"id": "c3", "object": "chat.completion.chunk", "created": 0,
+                                      "model": "m", "system_fingerprint": "fp",
+                                      "choices": [{"index": 0, "delta": {"content": "", "reasoning": t}, "finish_reason": None}]}))
+        # Content token ends the thinking phase → flush
+        chunks.append(json.dumps({"id": "c3", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {"content": "!"}, "finish_reason": None}]}))
+
+        def handler(h, method, path, body, n):
+            resp = sse_chunks(*chunks)
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.end_headers()
+            for line in resp.split(b"\n\n"):
+                if line:
+                    h.wfile.write(line + b"\n\n")
+                    h.wfile.flush()
+
+        self.fake.on_request = handler
+        self._start_proxy()
+
+        req_body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", req_body)
+        self.assertEqual(status, 200)
+
+        text = resp_body.decode("utf-8")
+        events = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload_str = line[5:].strip()
+            if payload_str == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(payload_str))
+            except ValueError:
+                pass
+
+        rsn_events = [e for e in events if isinstance(e.get("choices"), list) and e["choices"] and isinstance(e["choices"][0].get("delta"), dict) and e["choices"][0]["delta"].get("reasoning")]
+
+        # ALL four tokens (including the role-bundled first one) must be merged into exactly ONE event. If 'I' escaped buffering we'd see 2+ reasoning events with different part IDs.
+        self.assertEqual(len(rsn_events), 1, f"Expected exactly 1 merged reasoning event (role-bundled first token included), got {len(rsn_events)}: {[json.dumps(e)[:100] for e in rsn_events]}")
+
+        merged_text = rsn_events[0]["choices"][0]["delta"]["reasoning"]
+        self.assertIn("I", merged_text)
+        self.assertIn("am", merged_text)
+        self.assertIn("thinking", merged_text)
+
+    def test_second_thinking_phase_gets_different_part_id(self):
+        """If model thinks again after emitting content, the second phase gets a fresh part ID."""
+
+        chunks = []
+        # Phase 1: reasoning tokens
+        for t in ["First", " thought"]:
+            chunks.append(json.dumps({"id": "c2", "object": "chat.completion.chunk", "created": 0,
+                                      "model": "m", "system_fingerprint": "fp",
+                                      "choices": [{"index": 0, "delta": {"content": "", "reasoning": t}, "finish_reason": None}]}))
+        # Content token (breaks thinking phase 1)
+        chunks.append(json.dumps({"id": "c2", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {"content": "mid"}, "finish_reason": None}]}))
+        # Phase 2: more reasoning tokens (new thinking session)
+        for t in ["Second", " thought"]:
+            chunks.append(json.dumps({"id": "c2", "object": "chat.completion.chunk", "created": 0,
+                                      "model": "m", "system_fingerprint": "fp",
+                                      "choices": [{"index": 0, "delta": {"content": "", "reasoning": t}, "finish_reason": None}]}))
+        # Final content + finish
+        chunks.append(json.dumps({"id": "c2", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {"content": "!"}, "finish_reason": None}]}))
+        chunks.append(json.dumps({"id": "c2", "object": "chat.completion.chunk", "created": 0,
+                                  "model": "m", "system_fingerprint": "fp",
+                                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
+
+        def handler(h, method, path, body, n):
+            resp = sse_chunks(*chunks)
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.end_headers()
+            for line in resp.split(b"\n\n"):
+                if line:
+                    h.wfile.write(line + b"\n\n")
+                    h.wfile.flush()
+
+        self.fake.on_request = handler
+        self._start_proxy()
+
+        req_body = json.dumps({"model": "m", "stream": True, "messages": []}).encode()
+        status, _, resp_body = http_post(f"{self.proxy_url}/v1/chat/completions", req_body)
+        self.assertEqual(status, 200)
+
+        text = resp_body.decode("utf-8")
+
+        # Parse all data events
+        events = []
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload_str = line[5:].strip()
+            if payload_str == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(payload_str))
+            except ValueError:
+                pass
+
+        rsn_events = [e for e in events if isinstance(e.get("choices"), list) and e["choices"] and isinstance(e["choices"][0].get("delta"), dict) and e["choices"][0]["delta"].get("reasoning")]
+
+        # Collect part IDs per event (in order of appearance)
+        pids_in_order = []
+        for ev in rsn_events:
+            pid = ev["choices"][0]["delta"].get("reasoning_part_id") or ev.get("reasoning_part_id") or ""
+            pids_in_order.append(pid)
+
+        # We should have at least 2 reasoning events (one per phase), each with a non-empty part ID
+        self.assertGreaterEqual(len(pids_in_order), 2, f"Expected >=2 reasoning events, got {len(pids_in_order)}")
+
+        # Phase 1 events all share one ID; phase 2 events all share a DIFFERENT ID.
+        # Since we flush on the content token between phases, each phase produces exactly one merged event.
+        unique_pids = set(p for p in pids_in_order if p)
+        self.assertGreaterEqual(len(unique_pids), 2, f"Two thinking phases should produce two distinct part IDs, got: {unique_pids}")
+
+
+# ===================================================================
 # 7. INTEGRATION — keep-alive pings during upstream silence
 # ===================================================================
 

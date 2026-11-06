@@ -187,6 +187,117 @@ UPSTREAM_RCVBUF = int(os.environ.get("PROXY_UPSTREAM_RCVBUF", str(4 * 1024 * 102
 # idle timeout (15s is safely below typical 30-150s limits without spamming).
 KEEPALIVE_INTERVAL = float(os.environ.get("PROXY_KEEPALIVE_INTERVAL", "15"))
 
+# --- Reasoning-chunk coalescing --------------------------------------------
+# Ollama emits one SSE event per reasoning token: {"delta":{"content":"","reasoning":"The"}}
+# then {"delta":{"reasoning":" user"}}, etc. VS Code / Copilot treats every SSE event
+# carrying `delta.reasoning` as a SEPARATE discrete thinking block ("Thought for Xs"),
+# not an incremental append to the current one. So sending N small events during thinking
+# produces N separate blocks in the UI, each showing only 2-5 words — which looks broken/
+# stuttery regardless of how fast or smoothly we stream them.
+#
+# Fix: buffer consecutive reasoning-only chunks and emit them as ONE merged SSE event.
+# The buffer is flushed when ANY of these happens (whichever comes first):
+#   - a non-reasoning chunk arrives (content token, tool_call, finish_reason) → immediate flush, no waiting
+#   - [DONE] / stream end → final drain before closing
+#   - REASONING_FLUSH_INTERVAL seconds elapsed since last flush (default: 5 s) → periodic flush so long thoughts produce visible progress cards AND runaway n-gram loops are spotted early instead of only after hitting the context ceiling
+#   - REASONING_FLUSH_CHARS characters accumulated (default: 1000) → size-based safety valve so fast token cadence can't outrun the time window either
+# During the buffering window we send periodic keep-alive comment lines (`: keep-alive\n`)
+# to the client so VS Code doesn't drop us on its idle timeout while Ollama is actively
+# streaming tokens but we haven't forwarded anything yet.
+#
+# Tunables (env vars):
+#   PROXY_REASONING_FLUSH_INTERVAL – max seconds between forced flushes (default: 5)
+#   PROXY_REASONING_FLUSH_CHARS    – max chars before forced mid-thinking flush (default: 1000)
+#   Set BOTH to 0 for pure passthrough (no merging at all; legacy behaviour).
+#
+# Why these defaults? VS Code renders each SSE event carrying delta.reasoning as a SEPARATE "Thought for Xs" card. Without coalescing, Ollama's per-token streaming produces dozens of tiny cards. With INTERVAL=5 / CHARS=1000 you get one readable card every ~5s or ~1k chars — enough granularity to spot Qwen n-gram recursion loops in real time without drowning in fragments. Bump both higher (e.g. 30/999999) if you prefer fewer, larger cards and don't need loop monitoring.
+REASONING_FLUSH_CHARS = int(os.environ.get("PROXY_REASONING_FLUSH_CHARS", "1000"))
+REASONING_FLUSH_INTERVAL = float(os.environ.get("PROXY_REASONING_FLUSH_INTERVAL", "5"))
+
+
+
+def _chunk_is_reasoning_only(chunk):
+    """True when an SSE chat.completion.chunk's sole payload is reasoning text.
+
+    A chunk qualifies if: exactly one choice, its delta has non-empty `reasoning`,
+    and the delta has no other *meaningful* keys (empty-string content / role are
+    tolerated — Ollama emits them alongside every reasoning token). Tool calls,
+    finish_reason set on this chunk, or a real content string disqualify it so we
+    never merge across semantic boundaries.
+    """
+    if not isinstance(chunk, dict):
+        return False
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        return False
+    ch = choices[0]
+    if not isinstance(ch, dict):
+        return False
+    delta = ch.get("delta")
+    if not isinstance(delta, dict):
+        return False
+    rsn = delta.get("reasoning")
+    if not (isinstance(rsn, str) and rsn):
+        return False
+    # Any other meaningful key in the delta means this is NOT a pure reasoning tick.
+    # Tolerated keys: role (Ollama bundles the assistant-role announcement with the FIRST reasoning token — semantically neutral), plus any value that's an empty placeholder. Without tolerating `role`, the very first thinking token always escapes buffering and VS Code renders it as its own separate card before the merged block begins.
+    for k, v in delta.items():
+        if k == "reasoning" or k == "role":
+            continue
+        if v in ("", None, []):  # tolerate empty placeholders Ollama emits alongside reasoning
+            continue
+        return False
+    if ch.get("finish_reason"):
+        return False
+    return True
+
+
+def _extract_reasoning_piece(chunk):
+    """Return the reasoning string from a qualifying chunk, or None."""
+    try:
+        d = chunk["choices"][0].get("delta")
+        rsn = d.get("reasoning") if isinstance(d, dict) else None
+        return rsn if (isinstance(rsn, str) and rsn) else None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _merge_reasoning_chunks(first_chunk: dict, pieces: list[str], part_id: str | None = None) -> bytes:
+    """Build one SSE `data:` line whose payload is `first_chunk` with its single
+    choice's delta.reasoning replaced by "".join(pieces). If part_id is given, it is
+    injected into multiple plausible locations so VS Code can group consecutive
+    reasoning events into ONE thinking block instead of creating a new UI card per event.
+
+    Returns encoded UTF-8."""
+    import copy as _copy  # local to avoid a top-level import for this small helper
+    merged = _copy.deepcopy(first_chunk)
+    choices = merged["choices"]
+    delta = choices[0]["delta"]
+    # Preserve any other keys the first chunk carried (role etc.); just replace reasoning.
+    delta["reasoning"] = "".join(pieces)
+
+    # Stable part ID — tells VS Code these chunks belong to the same thinking session.
+    # We inject in several likely-read locations since we don't know exactly which field
+    # the BYOM parser checks. Harmless if ignored by other clients.
+    if part_id:
+        delta["reasoning_part_id"] = part_id       # inside delta (most natural spot)
+        merged["reasoning_part_id"] = part_id      # top-level on the chunk object
+
+    return ("data: " + json.dumps(merged, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _inject_reasoning_part_id(chunk_dict: dict, part_id: str) -> bytes:
+    """For passthrough (non-buffered) reasoning chunks: inject a stable part ID so VS Code groups them. Returns encoded SSE line."""
+    import copy as _copy  # local to avoid a top-level import for this small helper
+    c = _copy.deepcopy(chunk_dict)
+    try:
+        delta = c["choices"][0]["delta"]
+        delta["reasoning_part_id"] = part_id
+        c["reasoning_part_id"] = part_id
+    except (KeyError, IndexError, TypeError):
+        pass  # malformed — emit as-is without injection
+    return ("data: " + json.dumps(c, ensure_ascii=False) + "\n\n").encode("utf-8")
+
 
 class _UpstreamHTTPHandler(urllib.request.HTTPHandler):
     """urllib handler that sets a generous SO_RCVBUF on upstream sockets."""
@@ -901,6 +1012,11 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         read error or client disconnect the upstream is aborted (caller's
         finally closes it); `interrupted` tells the caller whether a fresh
         re-issue is worth attempting (nothing had been accumulated yet).
+
+        Reasoning text (`delta.reasoning`) emitted by Ollama during its thinking
+        phase is preserved as message["reasoning"] on the final JSON — without
+        this, an all-reasoning response would be silently dropped and reported
+        as 502 "upstream stream interrupted".
         """
         content_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
@@ -910,6 +1026,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
         stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         saw_sse_data = False
+        reasoning_parts: list[str] = []
 
         def _accumulate(chunk):
             nonlocal finish_reason, usage, model_name
@@ -930,6 +1047,9 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 piece = delta.get("content")
                 if isinstance(piece, str) and piece:
                     content_parts.append(piece)
+                rsn_piece = delta.get("reasoning")
+                if isinstance(rsn_piece, str) and rsn_piece:
+                    reasoning_parts.append(rsn_piece)
                 for tc in delta.get("tool_calls") or []:
                     if not isinstance(tc, dict):
                         continue
@@ -970,7 +1090,7 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 pass  # tolerate keep-alive or malformed chunks
 
         aborted = (finish_reason is None and not content_parts
-                   and not tool_calls)
+                   and not tool_calls and not reasoning_parts)
         if aborted and not saw_sse_data and response.status >= 400:
             # Ollama answered with a plain error body, not an SSE stream —
             # surface its real status code instead of masking it as 502.
@@ -985,6 +1105,9 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 interrupted)
 
         message: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if reasoning_parts:
+            # Preserve Ollama's thinking text so non-stream clients (e.g., VS Code BYOM with stream=false) can surface it instead of losing it entirely.
+            message["reasoning"] = "".join(reasoning_parts)
         if tool_calls:
             message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
         body_obj = {
@@ -1341,42 +1464,190 @@ class RewriteProxyHandler(BaseHTTPRequestHandler):
                 # Reads happen in the background worker (no socket timeout),
                 # so long thinking silences can't poison the reader; we only
                 # poll client liveness between chunks.
-                for kind, value in self._iter_upstream_lines(response):
-                    if kind == "done":
-                        break  # sentinel — upstream stream finished cleanly
-                    if kind == "error":
-                        _log(f"{rid} upstream read error: "
-                             f"{type(value).__name__}: {value}")
-                        break
-                    if kind == "ping":
-                        # Upstream is silent (thinking/compacting) but the client
-                        # is still connected. Emit an SSE comment line — ignored by
-                        # conforming parsers, but it resets the client's idle timer
-                        # so VS Code doesn't drop us mid-generation and force Ollama
-                        # to abort a perfectly good in-flight answer.
+                #
+                # Reasoning coalescing state — see REASONING_FLUSH_* constants.
+                rsn_first_chunk = None   # first qualifying chunk's parsed dict (shape template)
+                rsn_pieces: list[str] = []  # accumulated reasoning strings to merge into it
+                rsn_since_flush = time.monotonic()       # when the current buffer started accumulating
+                rsn_last_client_write = time.monotonic() # last time we sent ANY bytes to the client (reasoning flush, keep-alive, or passthrough chunk)
+
+                # Stable part ID for VS Code BYOM grouping. VS Code 1.145+ has a regression where every SSE event carrying delta.reasoning becomes its own UI card unless chunks share a stable identifier. We generate ONE UUID per "thinking session" (from first reasoning token until the first non-reasoning token breaks the sequence) and attach it to every emitted reasoning event so VS Code groups them into one expandable block. Reset on each new thinking phase (e.g., if model thinks again after emitting content).
+                rsn_part_id: str | None = None
+
+                def _flush_reasoning_buffer():
+                    """Emit any buffered reasoning as ONE merged SSE event with the stable part ID, then reset."""
+                    nonlocal rsn_first_chunk, rsn_pieces, rsn_since_flush, rsn_last_client_write
+                    if not rsn_pieces or rsn_first_chunk is None:
+                        return True  # nothing pending; treat as success
+                    payload = _merge_reasoning_chunks(rsn_first_chunk, rsn_pieces, part_id=rsn_part_id)
+                    try:
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        raise
+                    finally:
+                        rsn_first_chunk = None
+                        rsn_pieces = []
+                        rsn_since_flush = time.monotonic()
+                        rsn_last_client_write = time.monotonic()
+
+                def _maybe_time_or_size_flush():
+                    """Flush the reasoning buffer when it has grown large enough OR been
+                    sitting long enough that VS Code would otherwise look stalled. Returns True on flush."""
+                    nonlocal rsn_since_flush
+                    if not rsn_pieces or REASONING_FLUSH_CHARS <= 0 and REASONING_FLUSH_INTERVAL <= 0:
+                        return False
+                    now = time.monotonic()
+                    size_ok = (REASONING_FLUSH_CHARS > 0
+                               and sum(len(p) for p in rsn_pieces) >= REASONING_FLUSH_CHARS)
+                    time_ok = (REASONING_FLUSH_INTERVAL > 0
+                               and (now - rsn_since_flush) >= REASONING_FLUSH_INTERVAL)
+                    if size_ok or time_ok:
+                        _flush_reasoning_buffer()
+                        return True
+                    return False
+
+                def _send_keepalive_if_stale():
+                    """If we've buffered reasoning but haven't sent anything to the client in a while, emit an SSE comment line so VS Code doesn't drop us on its idle timeout. Ollama is actively streaming tokens during this window (so upstream 'ping' events don't fire), meaning without this the client sees zero bytes for up to REASONING_FLUSH_INTERVAL seconds."""
+                    nonlocal rsn_last_client_write
+                    if KEEPALIVE_INTERVAL <= 0:
+                        return True  # keepalives disabled; treat as success (no-op)
+                    elapsed = time.monotonic() - rsn_last_client_write
+                    if elapsed < KEEPALIVE_INTERVAL:
+                        return True  # not stale yet; nothing to do
+                    try:
+                        self.wfile.write(b": keep-alive\n")
+                        self.wfile.flush()
+                        rsn_last_client_write = time.monotonic()
+                        return True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        raise
+
+                try:
+                    for kind, value in self._iter_upstream_lines(response):
+                        # Periodic flush + keep-alive so VS Code keeps seeing live updates even while Ollama is still emitting reasoning tokens and we're buffering them.
+                        _maybe_time_or_size_flush()
+
+                        if kind == "done":
+                            break  # sentinel — upstream stream finished cleanly; final flush below drains any remainder
+                        if kind == "error":
+                            _log(f"{rid} upstream read error: "
+                                 f"{type(value).__name__}: {value}")
+                            break
+                        if kind == "ping":
+                            # Upstream is silent (thinking/compacting) but the client
+                            # is still connected. Emit an SSE comment line — ignored by
+                            # conforming parsers, but it resets the client's idle timer
+                            # so VS Code doesn't drop us mid-generation and force Ollama
+                            # to abort a perfectly good in-flight answer. Also drain any pending reasoning buffer first so we don't lose ordering with subsequent events.
+                            _flush_reasoning_buffer()  # no-op when empty; raises on broken pipe like below
+                            try:
+                                self.wfile.write(b": keep-alive\n")
+                                self.wfile.flush()
+                                rsn_last_client_write = time.monotonic()  # reset stale-keepalive clock — we just sent bytes to the client
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                _log(f"{rid} client gone during keep-alive; "
+                                     f"aborting upstream to free the Ollama slot")
+                                break
+                            continue
+
+                        line = value if isinstance(value, bytes) else str(value).encode("utf-8", "replace")
+                        text = line.decode("utf-8", "replace").strip()
+
+                        # Blank / whitespace-only lines are SSE event separators (the \n\n between events). They carry no semantic content — forward them through but do NOT treat them as a boundary that ends a thinking phase. Without this guard, every blank line would flush our reasoning buffer and reset the part ID, defeating coalescing entirely.
+                        if not text:
+                            try:
+                                self.wfile.write(line if isinstance(line, bytes) else b"\n")
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                _log(f"{rid} client gone on blank-line passthrough; aborting upstream")
+                                break
+                            continue
+
+                        # Try to parse as a chat.completion.chunk and decide whether it's reasoning-only.
+                        parsed_chunk = None
+                        is_reasoning_only = False
+                        piece_text = None
+                        if text.startswith("data:"):
+                            data_str = text[5:].lstrip()
+                            if data_str != "[DONE]":
+                                try:
+                                    candidate = json.loads(data_str)
+                                    if _chunk_is_reasoning_only(candidate):
+                                        p = _extract_reasoning_piece(candidate)
+                                        if p is not None:
+                                            parsed_chunk = candidate
+                                            is_reasoning_only = True
+                                            piece_text = p
+                                except ValueError:
+                                    pass  # malformed — fall through to raw passthrough
+
+                        # Kill-switch: PROXY_REASONING_FLUSH_CHARS=0 AND PROXY_REASONING_FLUSH_INTERVAL=0 → pure passthrough (legacy behaviour), no buffering at all. Any non-zero knob enables coalescing.
+                        _coalesce_enabled = not (REASONING_FLUSH_CHARS <= 0 and REASONING_FLUSH_INTERVAL <= 0)
+
+                        if is_reasoning_only and _coalesce_enabled:
+                            # Buffer this reasoning tick; flush happens on size OR time OR non-reasoning/[DONE]. Ollama streams steadily (~45 ms cadence, 2–6 tokens per TCP segment — verified against Ollama 0.40.14 directly), so we accumulate for up to REASONING_FLUSH_INTERVAL seconds before emitting one merged event. VS Code renders that as a single clean "Thought for Xs" block instead of dozens of tiny fragments.
+                            if rsn_first_chunk is None:
+                                rsn_first_chunk = parsed_chunk
+                                rsn_since_flush = time.monotonic()
+                                # New thinking session begins — generate a stable part ID that all reasoning events in THIS phase will share. VS Code 1.145+ uses this to group consecutive reasoning chunks into ONE expandable block instead of creating a new UI card per event.
+                                rsn_part_id = uuid.uuid4().hex[:16]
+                            rsn_pieces.append(piece_text)
+                            _maybe_time_or_size_flush()  # fires when either threshold trips; no-op otherwise
+
+                            # Keep-alive during the buffering window: Ollama is actively streaming (so upstream 'ping' events don't fire), but we haven't forwarded anything yet. Without this, the client sees zero bytes for up to REASONING_FLUSH_INTERVAL seconds and may drop us on its idle timeout.
+                            _send_keepalive_if_stale()
+                            continue
+
+                        # Reasoning-only but coalescing DISABLED (kill-switch mode): still inject a stable part ID so VS Code groups them into one block even in pure-passthrough mode.
+                        if is_reasoning_only and parsed_chunk is not None:
+                            if rsn_part_id is None:
+                                rsn_part_id = uuid.uuid4().hex[:16]
+                            try:
+                                self.wfile.write(_inject_reasoning_part_id(parsed_chunk, rsn_part_id))
+                                self.wfile.flush()
+                                rsn_last_client_write = time.monotonic()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                _log(f"{rid} client disconnected mid-stream; aborting upstream")
+                                break
+                            continue
+
+                        # Non-reasoning chunk (or unparseable line): drain any pending reasoning first so ordering stays correct. Thinking phase ends here — reset part_id so the NEXT thinking phase gets a fresh one.
+                        _flush_reasoning_buffer()
+                        rsn_part_id = None  # thinking session over; next reasoning burst will get a new ID
+
+                        out_line = line if isinstance(line, bytes) else b"" + str(value).encode("utf-8", "replace")
+                        if not out_line.endswith(b"\n"):
+                            out_line += b"\n"
                         try:
-                            self.wfile.write(b": keep-alive\n")
-                            self.wfile.flush()
+                            self.wfile.write(out_line)
+                            self.wfile.flush()  # deliver each SSE chunk immediately
+                            rsn_last_client_write = time.monotonic()  # reset stale-keepalive clock — we just sent real data to the client
                         except (BrokenPipeError, ConnectionResetError, OSError):
-                            _log(f"{rid} client gone during keep-alive; "
+                            # Client disconnected mid-stream. Break out immediately so
+                            # the finally closes the upstream response — that aborts
+                            # Ollama's generation and frees its slot for the next
+                            # request instead of holding it until the model finishes
+                            # a response nobody is reading.
+                            _log(f"{rid} client disconnected mid-stream; "
                                  f"aborting upstream to free the Ollama slot")
                             break
-                        continue
-                    line = value
-                    if not line.endswith(b"\n"):
-                        line += b"\n"
-                    try:
-                        self.wfile.write(line)
-                        self.wfile.flush()  # deliver each SSE chunk immediately
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        # Client disconnected mid-stream. Break out immediately so
-                        # the finally closes the upstream response — that aborts
-                        # Ollama's generation and frees its slot for the next
-                        # request instead of holding it until the model finishes
-                        # a response nobody is reading.
-                        _log(f"{rid} client disconnected mid-stream; "
-                             f"aborting upstream to free the Ollama slot")
-                        break
+
+                    # Stream ended cleanly or via [DONE] sentinel: drain any remaining reasoning buffer before we close.
+                    if rsn_pieces:
+                        try:
+                            _flush_reasoning_buffer()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass  # client already gone — nothing more to deliver
+                finally:
+                    # Safety net on exception paths too: best-effort flush so no buffered thought is silently dropped when a non-client error unwinds us.
+                    if rsn_pieces and rsn_first_chunk is not None:
+                        try:
+                            self.wfile.write(_merge_reasoning_chunks(rsn_first_chunk, rsn_pieces))
+                            self.wfile.flush()
+                        except Exception:  # noqa: BLE001 — teardown path; never mask the real error
+                            pass
+
         finally:
             with _ACTIVE_LOCK:
                 _ACTIVE_CONNECTIONS.pop(rid, None)

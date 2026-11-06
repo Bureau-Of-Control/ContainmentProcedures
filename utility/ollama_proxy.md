@@ -168,7 +168,22 @@ loop writes an SSE comment line (`: keep-alive`). Comment lines are ignored by
 conforming SSE parsers (so the stream stays well-formed) but they reset the
 client's idle timer, keeping VS Code connected while Ollama works. The
 non-streaming reassembler skips `ping` sentinels safely.
+### Reasoning chunk coalescing (VS Code thinking-card fix)
 
+Ollama emits one SSE event **per reasoning token** (`{"delta":{"reasoning":"The"}}`, then `{"delta":{"reasoning":" user"}}`, …). VS Code / Copilot renders each such event as a **separate discrete "Thought for Xs" card**, not an incremental append — so a 20-second thought produces ~60 tiny cards, each showing only 2–5 words. This looks broken regardless of streaming speed.
+
+The proxy buffers consecutive reasoning-only chunks and emits them as **one merged SSE event**. The buffer flushes when any of these happens (whichever comes first):
+
+- A **non-reasoning chunk** arrives (content token, tool_call, finish_reason) → immediate flush, no waiting.
+- `[DONE]` / stream end → final drain before closing the connection.
+- **Time window** elapses since last flush (`PROXY_REASONING_FLUSH_INTERVAL`, default **5 s**) → periodic flush so long thoughts still produce visible progress cards in the UI.
+- **Size threshold** reached (`PROXY_REASONING_FLUSH_CHARS`, default **1000 chars**) → size-based safety valve so fast token cadence can't outrun the time window either.
+
+During the buffering window the proxy sends periodic SSE comment lines (`: keep-alive`) to reset the client's idle timer (see keep-alive section above), so VS Code doesn't drop us while Ollama is actively streaming tokens but we haven't forwarded anything yet.
+
+Each thinking phase also gets a stable `reasoning_part_id` (UUID hex) injected into both `delta.reasoning_part_id` and top-level `chunk.reasoning_part_id`. This is included for protocol completeness; VS Code currently groups by event count rather than this field, but it costs nothing and may be used by future clients.
+
+**Why these defaults?** The 5s/1000-char combination gives one readable card every few seconds of continuous thinking — enough granularity to spot Qwen n-gram recursion loops in real time (you see repeated text appearing across successive cards within seconds) without drowning in fragments. Bump both higher (e.g. `30` / `999999`) if you prefer fewer, larger cards and don't need loop monitoring. Set **both** to `0` for pure passthrough (no merging at all; legacy behaviour).
 ### Patient retry for header-phase "slot busy" 503s
 
 Keep-alive pings only fire **after** response headers arrive (body phase). A
@@ -228,6 +243,8 @@ All have sane defaults; set them in the environment before starting the proxy.
 | `PROXY_KEEPALIVE_INTERVAL` | `15` | Seconds of upstream silence before emitting an SSE keep-alive ping (`: keep-alive`) to reset the client's idle timer during deep thinking. Must be well under the client's idle timeout (~150s for VS Code). `0` disables pings. |
 | `PROXY_BUSY_RETRY_BUDGET` | `120` | Total seconds (header phase) the proxy keeps re-issuing a request after fast retries are exhausted, waiting for a busy single slot to free up. Keep under the client's idle timeout (~150s). `0` disables patient retry (surface the 429/5xx immediately). |
 | `PROXY_BUSY_RETRY_INTERVAL` | `30` | Seconds between patient-retry attempts while waiting for the slot to free. |
+| `PROXY_REASONING_FLUSH_INTERVAL` | `5` | Max seconds of continuous reasoning before forcing a flush → one "Thought for Xs" card per window in VS Code. Catches n-gram recursion loops early. Bump higher (e.g. 30) for fewer/larger cards; set with CHARS both to `0` for pure passthrough. See [Reasoning chunk coalescing](#reasoning-chunk-coalescing-vs-code-thinking-card-fix). |
+| `PROXY_REASONING_FLUSH_CHARS` | `1000` | Max chars accumulated before forcing a mid-thinking flush (whichever of time/size comes first). Size-based safety valve so fast token cadence can't outrun the time window. Set with INTERVAL both to `0` for pure passthrough. |
 
 ## Suggested Ollama environment
 
